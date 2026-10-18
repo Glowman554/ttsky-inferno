@@ -61,6 +61,8 @@ module tt_um_toxicfox_inferno (
         .irq_software(irq_software), 
         .irq_timer(irq_timer),
         .time_value(time_value), 
+        .reservation_invalidate(1'b0),
+        .atomic_lock(),
         .retire_valid(retire_valid),
         .trap_valid(trap_valid)
     );
@@ -109,7 +111,9 @@ endmodule
 
 `default_nettype wire
 
-module BareMemory (
+module BareMemory #(
+    parameter MEM_WORDS = 8192
+) (
     input clk,
     input reset,
     input req_valid,
@@ -122,6 +126,7 @@ module BareMemory (
     input req_sc,
     input sc_reserved_valid,
     input [33:0] sc_reserved_address,
+    input reservation_invalidate,
     output req_ready,
     output reg [31:0] req_rdata,
     output reg req_error,
@@ -139,9 +144,12 @@ module BareMemory (
     input error
 );
     wire [33:0] physical_address = {2'b00, req_address};
-    wire ram_address = req_address >= 32'h40000000 && req_address < 32'h41000000;
+    wire ram_address = req_address < MEM_WORDS * 4 ||
+        (req_address >= 32'h40000000 && req_address < 32'h48000000);
 
-    wire sc_failed = req_sc && (!sc_reserved_valid || sc_reserved_address != {physical_address[33:2], 2'b00});
+    reg sc_invalidated;
+    wire sc_failed = req_sc && (!sc_reserved_valid || sc_invalidated ||
+        reservation_invalidate || sc_reserved_address != {physical_address[33:2], 2'b00});
     
     localparam IDLE = 2'd0;
     localparam ACCESS = 2'd1;
@@ -168,9 +176,11 @@ module BareMemory (
             req_rdata <= 0;
             req_error <= 0;
             sc_success <= 0;
+            sc_invalidated <= 0;
         end else begin
             case (state)
                 IDLE: if (req_valid) begin
+                    sc_invalidated <= reservation_invalidate;
                     req_rdata <= 0;
                     req_error <= 0;
                     sc_success <= 0;
@@ -178,6 +188,10 @@ module BareMemory (
                 end
 
                 ACCESS: begin
+                    if (req_sc && reservation_invalidate) begin
+                        sc_invalidated <= 1;
+                    end
+                    
                     if (denied) begin
                         req_error <= 1;
                         state <= RESPONSE;
@@ -207,7 +221,9 @@ module RiscV #(
     parameter [31:0] RESET_PC = 0,
     parameter TLB_ENTRIES = 2048,
     parameter MEM_WORDS = 8192,
-    parameter ENABLE_MMU = 1
+    parameter ENABLE_MMU = 1,
+    parameter [31:0] HART_ID = 0,
+    parameter ICACHE_WORDS = 0
 ) (
     input clk,
     input reset,
@@ -225,6 +241,8 @@ module RiscV #(
     input irq_machine,
     input irq_supervisor,
     input [63:0] time_value,
+    input reservation_invalidate,
+    output atomic_lock,
     output [1:0] privilege,
     output [1:0] data_privilege,
     output [31:0] satp_value,
@@ -280,6 +298,17 @@ module RiscV #(
     wire engine_write;
     wire sc_reserved_valid;
     wire sc_success;
+    wire fence_i_commit;
+    wire physical_valid;
+    wire [33:0] physical_address;
+    wire physical_write;
+    wire [31:0] physical_wdata;
+    wire [3:0] physical_wstrb;
+    wire [1:0] physical_kind;
+    wire physical_ready;
+    wire [31:0] physical_rdata;
+    wire physical_error;
+    assign atomic_lock = access_rmw || access_sc;
 
     wire csr_writes = csr_operation[1:0] == 1 || !csr_source_zero;
 
@@ -308,6 +337,7 @@ module RiscV #(
         .req_sc(access_sc),
         .sc_reserved_valid(sc_reserved_valid),
         .sc_reserved_address(sc_reserved_address),
+        .reservation_invalidate(reservation_invalidate),
         .req_privilege(engine_kind == 1 ? privilege : data_privilege),
         .satp(satp_value),
         .sum(status_value[18]),
@@ -320,18 +350,20 @@ module RiscV #(
         .req_page_fault(engine_page_fault),
         .sc_success(sc_success),
         .translated_address(translated_address),
-        .valid(valid),
-        .address(address),
-        .write(write),
-        .wdata(wdata),
-        .wstrb(wstrb),
-        .kind(kind),
-        .ready(ready),
-        .rdata(rdata),
-        .error(error)
+        .valid(physical_valid),
+        .address(physical_address),
+        .write(physical_write),
+        .wdata(physical_wdata),
+        .wstrb(physical_wstrb),
+        .kind(physical_kind),
+        .ready(physical_ready),
+        .rdata(physical_rdata),
+        .error(physical_error)
     );
     end else begin : direct_memory
-    BareMemory memory (
+    BareMemory #(
+        .MEM_WORDS(MEM_WORDS)
+    ) memory (
         .clk(clk),
         .reset(reset),
         .req_valid(engine_valid),
@@ -344,22 +376,62 @@ module RiscV #(
         .req_sc(access_sc),
         .sc_reserved_valid(sc_reserved_valid),
         .sc_reserved_address(sc_reserved_address),
+        .reservation_invalidate(reservation_invalidate),
         .req_ready(engine_ready),
         .req_rdata(engine_rdata),
         .req_error(engine_error),
         .req_page_fault(engine_page_fault),
         .sc_success(sc_success),
         .translated_address(translated_address),
-        .valid(valid),
-        .address(address),
-        .write(write),
-        .wdata(wdata),
-        .wstrb(wstrb),
-        .kind(kind),
-        .ready(ready),
-        .rdata(rdata), 
-        .error(error)
+        .valid(physical_valid),
+        .address(physical_address),
+        .write(physical_write),
+        .wdata(physical_wdata),
+        .wstrb(physical_wstrb),
+        .kind(physical_kind),
+        .ready(physical_ready),
+        .rdata(physical_rdata),
+        .error(physical_error)
     );
+    end endgenerate
+
+    generate if (ICACHE_WORDS > 0) begin : cached_instructions
+        InstructionCache #(
+            .CACHE_WORDS(ICACHE_WORDS),
+            .MEM_WORDS(MEM_WORDS)
+        ) cache (
+            .clk(clk),
+            .reset(reset),
+            .flush(fence_i_commit),
+            .valid(physical_valid),
+            .address(physical_address),
+            .write(physical_write),
+            .wdata(physical_wdata),
+            .wstrb(physical_wstrb),
+            .kind(physical_kind),
+            .ready(physical_ready),
+            .rdata(physical_rdata),
+            .error(physical_error),
+            .bus_valid(valid),
+            .bus_address(address),
+            .bus_write(write),
+            .bus_wdata(wdata),
+            .bus_wstrb(wstrb),
+            .bus_kind(kind),
+            .bus_ready(ready),
+            .bus_rdata(rdata),
+            .bus_error(error)
+        );
+    end else begin : uncached_instructions
+        assign valid = physical_valid;
+        assign address = physical_address;
+        assign write = physical_write;
+        assign wdata = physical_wdata;
+        assign wstrb = physical_wstrb;
+        assign kind = physical_kind;
+        assign physical_ready = ready;
+        assign physical_rdata = rdata;
+        assign physical_error = error;
     end endgenerate
 
     ExecutionUnit #(
@@ -388,6 +460,8 @@ module RiscV #(
         .sc_success(sc_success),
         .privilege(privilege),
         .clear_reservation(clear_reservation),
+        .fence_i_commit(fence_i_commit),
+        .reservation_invalidate(reservation_invalidate),
         .interrupt_pending(interrupt_pending),
         .interrupt_cause(interrupt_cause),
         .csr_valid(csr_valid),
@@ -418,7 +492,10 @@ module RiscV #(
         .pc(pc)
     );
 
-    CsrFile #(.ENABLE_MMU(ENABLE_MMU)) control (
+    CsrFile #(
+        .ENABLE_MMU(ENABLE_MMU),
+        .HART_ID(HART_ID)
+    ) control (
         .clk(clk),
         .reset(reset),
         .csr_valid(csr_valid),
@@ -460,7 +537,8 @@ module RiscV #(
 endmodule
 
 module CsrFile #(
-    parameter ENABLE_MMU = 1
+    parameter ENABLE_MMU = 1,
+    parameter [31:0] HART_ID = 0
 ) (
     input clk,
     input reset,
@@ -629,7 +707,8 @@ module CsrFile #(
             12'hb82, 12'hc82: csr_rdata = minstret[63:32];
             12'hc01: csr_rdata = time_value[31:0];
             12'hc81: csr_rdata = time_value[63:32];
-            12'hf11, 12'hf12, 12'hf13, 12'hf14, 12'hf15: csr_rdata = 0;
+            12'hf14: csr_rdata = HART_ID;
+            12'hf11, 12'hf12, 12'hf13, 12'hf15: csr_rdata = 0;
 
             default: begin
                 csr_known = pmp_known;
@@ -980,6 +1059,8 @@ module ExecutionUnit #(
     input error,
     input [1:0] privilege,
     input clear_reservation,
+    output fence_i_commit,
+    input reservation_invalidate,
     input interrupt_pending,
     input [4:0] interrupt_cause,
     output csr_valid,
@@ -1153,6 +1234,8 @@ module ExecutionUnit #(
     assign access_rmw = (state == ATOMIC_READ || state == ATOMIC_WRITE) && atomic_operation != 2 && atomic_operation != 3;
     assign access_atomic = state == ATOMIC_READ || state == ATOMIC_WRITE;
     assign access_sc = state == ATOMIC_WRITE && atomic_operation == 3;
+    assign fence_i_commit = !reset && state == EXECUTE && instruction[6:0] == 7'h0f &&
+        funct3 == 3'd1 && !illegal;
 
     assign trap_valid = !reset && state == TRAP;
     assign csr_valid = !reset && state == EXECUTE && csr_op;
@@ -1544,7 +1627,7 @@ module ExecutionUnit #(
                             atomic_operation <= instruction[31:27];
 
                             if (is_sc) begin
-                                sc_reserved_valid <= reservation_valid;
+                                sc_reserved_valid <= reservation_valid && !reservation_invalidate;
                                 sc_reserved_address <= reservation_address;
                                 reservation_valid <= 0;
                                 state <= ATOMIC_WRITE;
@@ -1626,8 +1709,105 @@ module ExecutionUnit #(
             endcase
 
             previous_privilege <= privilege;
-            if (clear_reservation || privilege != previous_privilege) begin
+            if (clear_reservation || reservation_invalidate || privilege != previous_privilege) begin
                 reservation_valid <= 0;
+            end
+        end
+    end
+endmodule
+
+module InstructionCache #(
+    parameter CACHE_WORDS = 256,
+    parameter MEM_WORDS = 8192
+) (
+    input clk,
+    input reset,
+    input flush,
+    input valid,
+    input [33:0] address,
+    input write,
+    input [31:0] wdata,
+    input [3:0] wstrb,
+    input [1:0] kind,
+    output ready,
+    output [31:0] rdata,
+    output error,
+    output bus_valid,
+    output [33:0] bus_address,
+    output bus_write,
+    output [31:0] bus_wdata,
+    output [3:0] bus_wstrb,
+    output [1:0] bus_kind,
+    input bus_ready,
+    input [31:0] bus_rdata,
+    input bus_error
+);
+    localparam INDEX_BITS = CACHE_WORDS > 1 ? $clog2(CACHE_WORDS) : 1;
+    wire [INDEX_BITS-1:0] index = CACHE_WORDS > 1 ? address[INDEX_BITS+1:2] : 0;
+    wire cacheable = kind == 2'd1 && !write && address[33:32] == 0 &&
+        (address[31:0] < MEM_WORDS * 4 ||
+         (address[31:0] >= 32'h40000000 && address[31:0] < 32'h48000000));
+
+    reg [CACHE_WORDS-1:0] valid_bits;
+    (* ram_style = "block", syn_ramstyle = "block_ram" *) reg [63:0] lines[0:CACHE_WORDS-1];
+    
+    reg [63:0] lookup_line;
+    reg lookup_valid;
+    reg lookup_pending;
+    reg [33:0] lookup_address;
+    
+    wire [INDEX_BITS-1:0] lookup_index = CACHE_WORDS > 1 ? lookup_address[INDEX_BITS+1:2] : 0;
+
+    wire hit = lookup_pending && lookup_valid && lookup_line[63:32] == lookup_address[33:2];
+    wire miss = lookup_pending && !hit;
+    wire accept = valid && cacheable && !lookup_pending;
+    wire fill = valid && miss && bus_ready && !bus_error && !flush;
+
+    assign ready = valid && (lookup_pending ? (hit || bus_ready) : (!cacheable && bus_ready));
+    assign rdata = hit ? lookup_line[31:0] : bus_rdata;
+    assign error = valid && bus_error && (lookup_pending ? !hit : !cacheable);
+    assign bus_valid = valid && (lookup_pending ? !hit : !cacheable);
+    assign bus_address = lookup_pending ? lookup_address : address;
+    assign bus_write = write;
+    assign bus_wdata = wdata;
+    assign bus_wstrb = wstrb;
+    assign bus_kind = kind;
+
+    // synthesis translate_off
+    initial if (CACHE_WORDS < 1 || (CACHE_WORDS & (CACHE_WORDS - 1)) != 0) begin
+        $fatal(1, "CACHE_WORDS must be a positive power of two");
+    end
+    // synthesis translate_on
+
+    always @(posedge clk) begin
+        if (accept) begin
+            lookup_line <= lines[index];
+        end
+
+        if (fill) begin
+            lines[lookup_index] <= {lookup_address[33:2], bus_rdata};
+        end
+    end
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            valid_bits <= 0;
+            lookup_pending <= 0;
+            lookup_valid <= 0;
+            lookup_address <= 0;
+        end else begin
+            if (flush) begin
+                valid_bits <= 0;
+            end else if (fill) begin
+                valid_bits[lookup_index] <= 1;
+            end
+
+            if (accept) begin
+                lookup_pending <= 1;
+                lookup_address <= address;
+                lookup_valid <= valid_bits[index] && !flush;
+            end else if (lookup_pending && (!valid || hit || bus_ready)) begin
+                lookup_pending <= 0;
             end
         end
     end
@@ -1652,6 +1832,7 @@ module Mmu #(
     input req_sc,
     input sc_reserved_valid,
     input [33:0] sc_reserved_address,
+    input reservation_invalidate,
     input [1:0] req_privilege,
     input [31:0] satp,
     input sum,
@@ -1687,6 +1868,7 @@ module Mmu #(
     reg [31:0] data;
     reg [33:0] pa;
     reg [33:0] pte_address;
+    reg [33:0] bus_address;
     reg [33:0] reserved_address;
     reg [1:0] size;
     reg [1:0] mode;
@@ -1698,6 +1880,7 @@ module Mmu #(
     reg atomic;
     reg sc;
     reg reserved_valid;
+    reg sc_invalidated;
     reg permit_sum;
     reg permit_mxr;
     reg level;
@@ -1722,12 +1905,17 @@ module Mmu #(
     wire leaf_fault = page_denied(rdata[7:0], mode, fetch, needs_write, !store || rmw, permit_sum, permit_mxr) ||
         (level && rdata[19:10] != 0);
 
+    wire walk_page_fault = pte_invalid || (leaf ? leaf_fault : (!level || rdata[7:6] != 0 || rdata[4]));
+    wire walk_error = error || walk_page_fault;
+
     localparam TLB_STORAGE = TLB_ENTRIES > 0 ? TLB_ENTRIES : 1;
     localparam TLB_INDEX_BITS = TLB_ENTRIES > 1 ? $clog2(TLB_ENTRIES) : 1;
     localparam [31:0] TLB_LAST_INDEX = TLB_STORAGE - 1;
 
     (* ram_style = "block", syn_ramstyle = "block_ram" *) reg [63:0] tlb_mem[0:TLB_STORAGE-1];
     reg [63:0] tlb_record;
+    reg fill_pending;
+    reg [63:0] fill_record;
     reg [13:0] tlb_generation;
     reg tlb_clearing;
     reg [TLB_INDEX_BITS-1:0] tlb_clear_index;
@@ -1753,13 +1941,16 @@ module Mmu #(
         !discard_fill && !tlb_clearing && walk_satp == satp;
 
     always @(posedge clk) begin
+        fill_pending <= !reset && fill;
+        fill_record <= {tlb_generation, va[31:12], leaf_ppn, rdata[7:0]};
+
         if (!reset && !tlb_clearing && state == IDLE && req_valid && TLB_ENTRIES > 0) begin
             tlb_record <= tlb_mem[lookup_index];
         end
         if (!reset && tlb_clearing) begin
             tlb_mem[tlb_clear_index] <= 64'd0;
-        end else if (!reset && fill) begin
-            tlb_mem[fill_index] <= {tlb_generation, va[31:12], leaf_ppn, rdata[7:0]};
+        end else if (!reset && fill_pending && !invalidate && !discard_fill && walk_satp == satp) begin
+            tlb_mem[fill_index] <= fill_record;
         end
     end
 
@@ -1778,7 +1969,8 @@ module Mmu #(
 
     wire walk_denied = !pmp_allowed || !is_ram(pte_address);
     wire access_denied = !pmp_allowed || (atomic && !is_ram(pa));
-    wire sc_failed = sc && (!reserved_valid || reserved_address != {pa[33:2], 2'b0});
+    wire sc_failed = sc && (!reserved_valid || sc_invalidated ||
+        reservation_invalidate || reserved_address != {pa[33:2], 2'b0});
 
     PmpCheck protection (
         .configuration(pmp_configuration),
@@ -1795,7 +1987,7 @@ module Mmu #(
     assign req_ready = !reset && state == RESPONSE && req_valid;
     assign translated_address = pa;
     assign valid = !reset && (state == WALK || state == ACCESS);
-    assign address = state == WALK ? pte_address : {pa[33:2], 2'b0};
+    assign address = bus_address;
     assign write = state == ACCESS && store;
     assign wdata = data;
     assign wstrb = write ? strobes : 4'd0;
@@ -1819,8 +2011,10 @@ module Mmu #(
             size <= 0;
             mode <= 3;
             pte_address <= 0;
+            bus_address <= 0;
             reserved_address <= 0;
             reserved_valid <= 0;
+            sc_invalidated <= 0;
             access_kind <= 0;
             strobes <= 0;
             store <= 0;
@@ -1841,6 +2035,10 @@ module Mmu #(
             walk_satp <= 0;
             discard_fill <= 0;
         end else begin
+            if (sc && reservation_invalidate && state != IDLE) begin
+                sc_invalidated <= 1;
+            end
+            
             cached_satp <= satp;
 
             if (tlb_clearing) begin
@@ -1880,6 +2078,7 @@ module Mmu #(
                         atomic <= req_atomic;
                         sc <= req_sc;
                         reserved_valid <= sc_reserved_valid;
+                        sc_invalidated <= reservation_invalidate;
                         reserved_address <= sc_reserved_address;
                         walk_satp <= satp;
                         discard_fill <= 0;
@@ -1897,7 +2096,7 @@ module Mmu #(
                         end else if (TLB_ENTRIES > 0) begin
                             state <= TLB_LOOKUP;
                         end else begin
-                            pte_address <= {satp[21:0], 12'd0} + {22'd0, req_address[31:22], 2'd0};
+                            pte_address <= {satp[21:0], req_address[31:22], 2'b0};
                             level <= 1;
                             state <= WALK_CHECK;
                         end
@@ -1913,13 +2112,14 @@ module Mmu #(
                             state <= ACCESS_CHECK;
                         end
                     end else begin
-                        pte_address <= {walk_satp[21:0], 12'd0} + {22'd0, va[31:22], 2'd0};
+                        pte_address <= {walk_satp[21:0], va[31:22], 2'b0};
                         level <= 1;
                         state <= WALK_CHECK;
                     end
                 end
 
                 WALK_CHECK: begin
+                    bus_address <= pte_address;
                     if (walk_denied) begin
                         fault(0);
                     end else begin
@@ -1929,21 +2129,16 @@ module Mmu #(
 
                 WALK: begin
                     if (ready) begin
-                        if (error) begin
-                            fault(0);
-                        end else if (pte_invalid) begin
-                            fault(1);
+                        pa <= level ? {rdata[31:20], va[21:0]} : {rdata[31:10], va[11:0]};
+                        pte_address <= {rdata[31:10], va[21:12], 2'b0};
+                        req_error <= walk_error;
+                        req_page_fault <= !error && walk_page_fault;
+                        sc_success <= 0;
+                        if (walk_error) begin
+                            state <= RESPONSE;
                         end else if (leaf) begin
-                            if (leaf_fault) begin
-                                fault(1);
-                            end else begin
-                                pa <= level ? {rdata[31:20], va[21:0]} : {rdata[31:10], va[11:0]};
-                                state <= ACCESS_CHECK;
-                            end
-                        end else if (!level || rdata[7:6] != 0 || rdata[4]) begin
-                            fault(1);
+                            state <= ACCESS_CHECK;
                         end else begin
-                            pte_address <= {rdata[31:10], 12'd0} + {22'd0, va[21:12], 2'd0};
                             level <= 0;
                             state <= WALK_CHECK;
                         end
@@ -1951,6 +2146,7 @@ module Mmu #(
                 end
 
                 ACCESS_CHECK: begin
+                    bus_address <= {pa[33:2], 2'b0};
                     if (access_denied) begin
                         fault(0);
                     end else if (sc_failed) begin
@@ -1962,7 +2158,10 @@ module Mmu #(
                 end
 
                 ACCESS: begin
-                    if (ready) begin
+                    if (sc_failed) begin
+                        sc_success <= 0;
+                        state <= RESPONSE;
+                    end else if (ready) begin
                         if (error) begin
                             fault(0);
                         end else begin
@@ -2181,84 +2380,102 @@ module PmpCheck (
     input write_access,
     output reg allowed
 );
-    integer entry;
-    reg found;
+    wire [35:0] input_first_byte = {2'd0, address};
+    wire [35:0] input_end_byte = input_first_byte + (36'd1 << size);
+    wire [35:0] first_byte;
+    wire [35:0] end_byte;
+    wire [1:0] decision[1:15];
+    wire default_allowed;
+    wire invalid_access;
 
-    wire [35:0] napot_mask[0:7];
+    assign first_byte = input_first_byte;
+    assign end_byte = input_end_byte;
+    assign default_allowed = privilege == 3;
+    assign invalid_access = size == 3 || privilege == 2;
+
     genvar region;
     genvar mask_bit;
+    genvar node;
 
     generate
-        for (region = 0; region < 8; region = region + 1) begin : napot_masks
-            assign napot_mask[region][2:0] = 3'b111;
-            assign napot_mask[region][35] = 1'b0;
+        for (region = 0; region < 8; region = region + 1) begin : regions
+            wire [7:0] cfg = configuration[region*8 +: 8];
+            wire [31:0] encoded = addresses[region*32 +: 32];
+            wire [35:0] napot_mask;
+            wire [35:0] tor_lower;
+            reg [35:0] lower;
+            reg [35:0] upper;
+
+            assign napot_mask[2:0] = 3'b111;
+            assign napot_mask[35] = 1'b0;
             for (mask_bit = 3; mask_bit < 35; mask_bit = mask_bit + 1) begin : prefix
-                assign napot_mask[region][mask_bit] = &addresses[region*32 +: mask_bit-2];
+                assign napot_mask[mask_bit] = &encoded[mask_bit-3:0];
             end
+
+            if (region == 0) begin : first
+                assign tor_lower = 0;
+            end else begin : following
+                assign tor_lower = {2'd0, addresses[(region-1)*32 +: 32], 2'd0};
+            end
+
+            always @(*) begin
+                lower = 0;
+                upper = 0;
+
+                case (cfg[4:3])
+                    1: begin
+                        lower = tor_lower;
+                        upper = {2'd0, encoded, 2'd0};
+                    end
+
+                    2: begin
+                        lower = {2'd0, encoded, 2'd0};
+                        upper = lower + 4;
+                    end
+
+                    3: begin
+                        lower = {2'd0, encoded, 2'd0} & ~napot_mask;
+                        upper = ({2'd0, encoded, 2'd0} | napot_mask) + 36'd1;
+                    end
+
+                    default: ;
+                endcase
+            end
+
+            wire [35:0] lower_bound;
+            wire [35:0] upper_bound;
+            wire enabled;
+            wire access_permitted;
+            wire permission = (privilege == 3 && !cfg[7]) ||
+                ((!execute || cfg[2]) && (!read_access || cfg[0]) && (!write_access || cfg[1]));
+
+            assign lower_bound = lower;
+            assign upper_bound = upper;
+            assign enabled = cfg[4:3] != 0;
+            assign access_permitted = permission;
+
+            wire matched = enabled && lower_bound < upper_bound && first_byte < upper_bound && end_byte > lower_bound;
+            wire permitted = first_byte >= lower_bound && end_byte <= upper_bound && access_permitted;
+
+            assign decision[8+region] = {matched, permitted};
+        end
+
+        for (node = 1; node < 8; node = node + 1) begin : branches
+            assign decision[node] = decision[2*node][1] ? decision[2*node] : decision[2*node+1];
         end
     endgenerate
 
-    reg [7:0] cfg;
-    reg [31:0] encoded;
-    reg [35:0] lower;
-    reg [35:0] upper;
-    reg [35:0] first_byte;
-    reg [35:0] end_byte;
-
     always @(*) begin
-        allowed = privilege == 3;
-        found = 0;
-        cfg = 0;
-        encoded = 0;
-        lower = 0;
-        upper = 0;
-        first_byte = {2'd0, address};
-        end_byte = first_byte + (36'd1 << size);
-
-        for (entry = 0; entry < 8; entry = entry + 1) begin
-            cfg = configuration[entry*8 +: 8];
-            encoded = addresses[entry*32 +: 32];
-            lower = 0;
-            upper = 0;
-
-            case (cfg[4:3])
-                1: begin
-                    if (entry != 0) begin
-                        lower = {2'd0, addresses[(entry-1)*32 +: 32], 2'd0};
-                    end
-
-                    upper = {2'd0, encoded, 2'd0};
-                end
-
-                2: begin
-                    lower = {2'd0, encoded, 2'd0};
-                    upper = lower + 4;
-                end
-
-                3: begin
-                    lower = {2'd0, encoded, 2'd0} & ~napot_mask[entry];
-                    upper = ({2'd0, encoded, 2'd0} | napot_mask[entry]) + 36'd1;
-                end
-
-                default: ;
-            endcase
-
-            if (!found && cfg[4:3] != 0 && lower < upper && first_byte < upper && end_byte > lower) begin
-                found = 1;
-                allowed = first_byte >= lower && end_byte <= upper &&
-                    ((privilege == 3 && !cfg[7]) ||
-                     ((!execute || cfg[2]) && (!read_access || cfg[0]) && (!write_access || cfg[1])));
-            end
-        end
-
-        if (size == 3 || privilege == 2) begin
+        allowed = decision[1][1] ? decision[1][0] : default_allowed;
+        if (invalid_access) begin
             allowed = 0;
         end
     end
 endmodule
 
 module Clint #(
-    parameter [31:0] BASE_ADDRESS = 32'h02000000
+    parameter [31:0] BASE_ADDRESS = 32'h02000000,
+    parameter NUM_HARTS = 1
 ) (
     input clk,
     input reset,
@@ -2267,52 +2484,85 @@ module Clint #(
     input [3:0] write_mask,
     input write_enable,
     output reg [31:0] read_data,
-    output irq_software,
-    output irq_timer,
+    output [NUM_HARTS-1:0] irq_software,
+    output [NUM_HARTS-1:0] irq_timer,
     output [63:0] time_value
 );
     wire [31:0] word_address = {address[31:2], 2'b00};
-    reg msip;
+    reg [NUM_HARTS-1:0] msip;
     reg [63:0] mtime;
-    reg [63:0] mtimecmp;
+    reg [63:0] mtimecmp[0:NUM_HARTS-1];
     integer lane;
+    integer hart;
+    integer reset_hart;
 
     assign irq_software = msip;
-    assign irq_timer = mtime >= mtimecmp;
+    genvar h;
+    generate for (h = 0; h < NUM_HARTS; h = h + 1) begin : timers
+        assign irq_timer[h] = mtime >= mtimecmp[h];
+    end endgenerate
     assign time_value = mtime;
 
     always @(*) begin
-        case (word_address)
-            BASE_ADDRESS: read_data = {31'd0, msip};
-            BASE_ADDRESS + 32'h4000: read_data = mtimecmp[31:0];
-            BASE_ADDRESS + 32'h4004: read_data = mtimecmp[63:32];
-            BASE_ADDRESS + 32'hbff8: read_data = mtime[31:0];
-            BASE_ADDRESS + 32'hbffc: read_data = mtime[63:32];
-            default: read_data = 0;
-        endcase
+        read_data = 0;
+        if (word_address == BASE_ADDRESS + 32'hbff8) begin
+            read_data = read_data | mtime[31:0];
+        end
+
+        if (word_address == BASE_ADDRESS + 32'hbffc) begin
+            read_data = read_data | mtime[63:32];
+        end
+
+        for (hart = 0; hart < NUM_HARTS; hart = hart + 1) begin
+            if (word_address == BASE_ADDRESS + hart * 4) begin
+                read_data = read_data | {31'd0, msip[hart]};
+            end
+
+            if (word_address == BASE_ADDRESS + 32'h4000 + hart * 8) begin
+                read_data = read_data | mtimecmp[hart][31:0];
+            end
+
+            if (word_address == BASE_ADDRESS + 32'h4004 + hart * 8) begin
+                read_data = read_data | mtimecmp[hart][63:32];
+            end
+        end
     end
 
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             msip <= 0;
             mtime <= 0;
-            mtimecmp <= 64'hffff_ffff_ffff_ffff;
+            for (reset_hart = 0; reset_hart < NUM_HARTS; reset_hart = reset_hart + 1) begin
+                mtimecmp[reset_hart] <= 64'hffff_ffff_ffff_ffff;
+            end
         end else begin
             mtime <= mtime + 64'd1;
             if (write_enable) begin
-                if (word_address == BASE_ADDRESS && write_mask[0]) begin
-                    msip <= write_data[0];
+                for (hart = 0; hart < NUM_HARTS; hart = hart + 1) begin
+                    if (word_address == BASE_ADDRESS + hart * 4 && write_mask[0]) begin
+                        msip[hart] <= write_data[0];
+                    end
                 end
                 
                 for (lane = 0; lane < 4; lane = lane + 1) begin
                     if (write_mask[lane]) begin
-                        case (word_address)
-                            BASE_ADDRESS + 32'h4000: mtimecmp[lane*8 +: 8] <= write_data[lane*8 +: 8];
-                            BASE_ADDRESS + 32'h4004: mtimecmp[32+lane*8 +: 8] <= write_data[lane*8 +: 8];
-                            BASE_ADDRESS + 32'hbff8: mtime[lane*8 +: 8] <= write_data[lane*8 +: 8];
-                            BASE_ADDRESS + 32'hbffc: mtime[32+lane*8 +: 8] <= write_data[lane*8 +: 8];
-                            default: ;
-                        endcase
+                        for (hart = 0; hart < NUM_HARTS; hart = hart + 1) begin
+                            if (word_address == BASE_ADDRESS + 32'h4000 + hart * 8) begin
+                                mtimecmp[hart][lane*8 +: 8] <= write_data[lane*8 +: 8];
+                            end
+
+                            if (word_address == BASE_ADDRESS + 32'h4004 + hart * 8) begin
+                                mtimecmp[hart][32+lane*8 +: 8] <= write_data[lane*8 +: 8];
+                            end
+                        end
+
+                        if (word_address == BASE_ADDRESS + 32'hbff8) begin
+                            mtime[lane*8 +: 8] <= write_data[lane*8 +: 8];
+                        end
+
+                        if (word_address == BASE_ADDRESS + 32'hbffc) begin
+                            mtime[32+lane*8 +: 8] <= write_data[lane*8 +: 8];
+                        end
                     end
                 end
             end
@@ -2321,6 +2571,8 @@ module Clint #(
 endmodule
 
 module DdrAdapter #(
+    parameter DDR_DATA_WIDTH = 128,
+    parameter DDR_ADDR_WIDTH = DDR_DATA_WIDTH == 256 ? 29 : 28,
     parameter CACHE_BYTES = 4096
 ) (
     input clk,
@@ -2338,13 +2590,13 @@ module DdrAdapter #(
     input ddr_cmd_ready,
     output [2:0] ddr_cmd,
     output ddr_cmd_en,
-    output [27:0] ddr_addr,
+    output [DDR_ADDR_WIDTH-1:0] ddr_addr,
     input ddr_wr_data_rdy,
-    output [127:0] ddr_wr_data,
+    output [DDR_DATA_WIDTH-1:0] ddr_wr_data,
     output ddr_wr_data_en,
     output ddr_wr_data_end,
-    output [15:0] ddr_wr_data_mask,
-    input [127:0] ddr_rd_data,
+    output [DDR_DATA_WIDTH/8-1:0] ddr_wr_data_mask,
+    input [DDR_DATA_WIDTH-1:0] ddr_rd_data,
     input ddr_rd_data_valid
 );
     (* async_reg = "true" *) reg [1:0] calib_sync;
@@ -2373,10 +2625,10 @@ module DdrAdapter #(
     wire [27:0] mem_address;
     wire [31:0] mem_write_data;
     wire [3:0] mem_write_mask;
-    wire [127:0] mem_read_line;
+    wire [DDR_DATA_WIDTH-1:0] mem_read_line;
     wire mem_done;
 
-    DdrCache #(.CACHE_BYTES(CACHE_BYTES)) cache (
+    DdrCache #(.CACHE_BYTES(CACHE_BYTES), .DDR_DATA_WIDTH(DDR_DATA_WIDTH)) cache (
         .clk(clk),
         .reset(bridge_reset),
         .start(start),
@@ -2398,7 +2650,7 @@ module DdrAdapter #(
         .mem_done(mem_done)
     );
 
-    DdrBridge bridge (
+    DdrBridge #(.DDR_DATA_WIDTH(DDR_DATA_WIDTH), .DDR_ADDR_WIDTH(DDR_ADDR_WIDTH)) bridge (
         .clk(clk),
         .reset(bridge_reset),
         .start(mem_start),
@@ -2427,6 +2679,7 @@ module DdrAdapter #(
 endmodule
 
 module DdrCache #(
+    parameter DDR_DATA_WIDTH = 128,
     parameter CACHE_BYTES = 4096
 ) (
     input clk,
@@ -2439,7 +2692,7 @@ module DdrCache #(
     input [31:0] write_data,
     input [3:0] write_mask,
     output [31:0] read_data,
-    output reg [127:0] read_line,
+    output reg [DDR_DATA_WIDTH-1:0] read_line,
     output reg done,
 
     output mem_start,
@@ -2448,19 +2701,21 @@ module DdrCache #(
     output [27:0] mem_address,
     output [31:0] mem_write_data,
     output [3:0] mem_write_mask,
-    input [127:0] mem_read_line,
+    input [DDR_DATA_WIDTH-1:0] mem_read_line,
     input mem_done
 );
-    localparam LINE_COUNT = CACHE_BYTES / 16;
+    localparam LINE_BYTES = DDR_DATA_WIDTH / 8;
+    localparam OFFSET_BITS = $clog2(LINE_BYTES);
+    localparam LINE_COUNT = CACHE_BYTES / LINE_BYTES;
     localparam INDEX_BITS = $clog2(LINE_COUNT);
     localparam INDEX_WIDTH = INDEX_BITS == 0 ? 1 : INDEX_BITS;
-    localparam TAG_BITS = 28 - 4 - INDEX_BITS;
+    localparam TAG_BITS = 28 - OFFSET_BITS - INDEX_BITS;
 
     // synthesis translate_off
     initial begin
-        if (CACHE_BYTES < 16 || CACHE_BYTES >= 268435456 ||
+        if ((DDR_DATA_WIDTH != 128 && DDR_DATA_WIDTH != 256) || CACHE_BYTES < LINE_BYTES || CACHE_BYTES >= 268435456 ||
             (CACHE_BYTES & (CACHE_BYTES - 1)) != 0) begin
-            $fatal(1, "CACHE_BYTES must be a power of two from 16 to 134217728");
+            $fatal(1, "DDR_DATA_WIDTH must be 128 or 256; CACHE_BYTES must be a power of two >= DDR_DATA_WIDTH/8 and < 256 MiB");
         end
     end
     // synthesis translate_on
@@ -2473,20 +2728,20 @@ module DdrCache #(
     reg [3:0] req_mask;
 
     reg [LINE_COUNT-1:0] cache_valid;
-    wire [127:0] lookup_line;
+    wire [DDR_DATA_WIDTH-1:0] lookup_line;
     reg [TAG_BITS-1:0] lookup_tag;
     reg lookup_valid;
 
-    wire [INDEX_WIDTH-1:0] address_index = INDEX_BITS == 0 ? {INDEX_WIDTH{1'b0}} : address[INDEX_WIDTH+3:4];
-    wire [INDEX_WIDTH-1:0] req_index = INDEX_BITS == 0 ? {INDEX_WIDTH{1'b0}} : req_address[INDEX_WIDTH+3:4];
-    wire [TAG_BITS-1:0] req_tag = req_address[27:INDEX_BITS+4];
+    wire [INDEX_WIDTH-1:0] address_index = INDEX_BITS == 0 ? {INDEX_WIDTH{1'b0}} : address[INDEX_WIDTH+OFFSET_BITS-1:OFFSET_BITS];
+    wire [INDEX_WIDTH-1:0] req_index = INDEX_BITS == 0 ? {INDEX_WIDTH{1'b0}} : req_address[INDEX_WIDTH+OFFSET_BITS-1:OFFSET_BITS];
+    wire [TAG_BITS-1:0] req_tag = req_address[27:INDEX_BITS+OFFSET_BITS];
 
     wire accept = start && !pending && !lookup_pending && !done;
     wire cache_hit = lookup_valid && lookup_tag == req_tag;
     wire cache_fill = pending && mem_done && !req_write;
     wire cache_store = lookup_pending && cache_hit && req_write;
 
-    assign read_data = read_line[req_address[3:2]*32 +: 32];
+    assign read_data = read_line[req_address[OFFSET_BITS-1:2]*32 +: 32];
     assign mem_start = pending;
     assign mem_clear = pending && mem_done;
     assign mem_write = req_write;
@@ -2508,11 +2763,11 @@ module DdrCache #(
 
     genvar bank;
     generate
-        for (bank = 0; bank < 4; bank = bank + 1) begin : banks
+        for (bank = 0; bank < DDR_DATA_WIDTH/32; bank = bank + 1) begin : banks
             (* ram_style = "block", syn_ramstyle = "block_ram" *) reg [31:0] mem [0:LINE_COUNT-1];
             reg [31:0] lookup_word;
 
-            wire bank_write = cache_fill || (cache_store && req_address[3:2] == bank);
+            wire bank_write = cache_fill || (cache_store && req_address[OFFSET_BITS-1:2] == bank);
             wire [31:0] store_word = {
                 req_mask[3] ? req_data[31:24] : lookup_word[31:24],
                 req_mask[2] ? req_data[23:16] : lookup_word[23:16],
@@ -2583,7 +2838,10 @@ module DdrCache #(
     end
 endmodule
 
-module DdrBridge (
+module DdrBridge #(
+    parameter DDR_DATA_WIDTH = 128,
+    parameter DDR_ADDR_WIDTH = DDR_DATA_WIDTH == 256 ? 29 : 28
+) (
     input clk,
     input reset,
 
@@ -2594,7 +2852,7 @@ module DdrBridge (
     input [31:0] write_data,
     input [3:0] write_mask,
     output [31:0] read_data,
-    output reg [127:0] read_line,
+    output reg [DDR_DATA_WIDTH-1:0] read_line,
     output reg done,
 
     input ddr_clk,
@@ -2602,15 +2860,16 @@ module DdrBridge (
     input ddr_cmd_ready,
     output [2:0] ddr_cmd,
     output ddr_cmd_en,
-    output [27:0] ddr_addr,
+    output [DDR_ADDR_WIDTH-1:0] ddr_addr,
     input ddr_wr_data_rdy,
-    output [127:0] ddr_wr_data,
+    output [DDR_DATA_WIDTH-1:0] ddr_wr_data,
     output ddr_wr_data_en,
     output ddr_wr_data_end,
-    output [15:0] ddr_wr_data_mask,
-    input [127:0] ddr_rd_data,
+    output [DDR_DATA_WIDTH/8-1:0] ddr_wr_data_mask,
+    input [DDR_DATA_WIDTH-1:0] ddr_rd_data,
     input ddr_rd_data_valid
 );
+    localparam OFFSET_BITS = $clog2(DDR_DATA_WIDTH/8);
     localparam CMD_WRITE = 3'd0;
     localparam CMD_READ = 3'd1;
 
@@ -2622,7 +2881,7 @@ module DdrBridge (
     reg [31:0] req_data;
     reg [3:0] req_mask;
 
-    reg [127:0] ddr_result;
+    reg [DDR_DATA_WIDTH-1:0] ddr_result;
     reg ack_toggle;
 
     (* async_reg = "true" *) reg [2:0] ack_sync;
@@ -2662,15 +2921,14 @@ module DdrBridge (
         end
     end
 
-    assign read_data = read_line[req_address[3:2]*32 +: 32];
+    assign read_data = read_line[req_address[OFFSET_BITS-1:2]*32 +: 32];
 
     // ----------------------- DDR domain -----------------------
-    wire [26:0] word = req_address[27:1];
-    assign ddr_addr = {1'b0, word[12:10], word[26:13], word[9:3], 3'b000};
-
-    wire [1:0] lane = req_address[3:2];
-    assign ddr_wr_data = {4{req_data}};
-    assign ddr_wr_data_mask = ~({12'd0, req_mask} << {lane, 2'b00});
+    wire [27:0] word = req_address >> $clog2(DDR_DATA_WIDTH/64);
+    assign ddr_addr = {1'b0, word[12:10], word[DDR_ADDR_WIDTH-2:13], word[9:3], 3'b000};
+    wire [OFFSET_BITS-3:0] lane = req_address[OFFSET_BITS-1:2];
+    assign ddr_wr_data = {(DDR_DATA_WIDTH/32){req_data}};
+    assign ddr_wr_data_mask = ~({{(DDR_DATA_WIDTH/8-4){1'b0}}, req_mask} << (lane * 4));
 
     (* async_reg = "true" *) reg [2:0] req_sync;
     (* async_reg = "true" *) reg [1:0] ddr_reset_sync;
@@ -2822,10 +3080,120 @@ module Gpio #(
         end
     end
 endmodule
+module MultiCoreArbiter #(
+    parameter NUM_HARTS = 2
+) (
+    input clk,
+    input reset,
+    input [NUM_HARTS-1:0] request_valid,
+    input [NUM_HARTS*34-1:0] request_address,
+    input [NUM_HARTS-1:0] request_write,
+    input [NUM_HARTS*32-1:0] request_wdata,
+    input [NUM_HARTS*4-1:0] request_wstrb,
+    input [NUM_HARTS*2-1:0] request_kind,
+    input [NUM_HARTS-1:0] request_lock,
+    output [NUM_HARTS-1:0] request_ready,
+    output [NUM_HARTS*32-1:0] request_rdata,
+    output [NUM_HARTS-1:0] request_error,
+    output [NUM_HARTS-1:0] reservation_invalidate,
+    output master_valid,
+    output reg [33:0] master_address,
+    output reg master_write,
+    output reg [31:0] master_wdata,
+    output reg [3:0] master_wstrb,
+    output reg [1:0] master_kind,
+    input master_ready,
+    input [31:0] master_rdata,
+    input master_error
+);
+    localparam HART_BITS = NUM_HARTS > 1 ? $clog2(NUM_HARTS) : 1;
+    reg busy;
+    reg [NUM_HARTS-1:0] grant;
+    reg [HART_BITS-1:0] owner;
+    reg [HART_BITS-1:0] last_owner;
+    reg [HART_BITS-1:0] next_owner;
+    reg [HART_BITS-1:0] after_owner;
+    reg found;
+    reg found_after;
+    integer scan;
+
+    always @(*) begin
+        next_owner = last_owner;
+        after_owner = last_owner;
+        found = 0;
+        found_after = 0;
+
+        for (scan = NUM_HARTS-1; scan >= 0; scan = scan - 1) begin
+            if (request_valid[scan]) begin
+                next_owner = scan[HART_BITS-1:0];
+                found = 1;
+                if (scan[HART_BITS-1:0] > last_owner) begin
+                    after_owner = scan[HART_BITS-1:0];
+                    found_after = 1;
+                end
+            end
+        end
+
+        if (found_after) begin
+            next_owner = after_owner;
+        end
+    end
+
+    wire selected_valid = busy && request_valid[owner];
+    wire completed = selected_valid && master_ready;
+    wire committed_write = completed && !master_error && master_write;
+
+    assign master_valid = selected_valid;
+    integer mux;
+    always @(*) begin
+        master_address = 0;
+        master_write = 0;
+        master_wdata = 0;
+        master_wstrb = 0;
+        master_kind = 0;
+        for (mux = 0; mux < NUM_HARTS; mux = mux + 1) begin
+            master_address = master_address | ({34{grant[mux]}} & request_address[mux*34 +: 34]);
+            master_write = master_write | (grant[mux] && request_write[mux]);
+            master_wdata = master_wdata | ({32{grant[mux]}} & request_wdata[mux*32 +: 32]);
+            master_wstrb = master_wstrb | ({4{grant[mux]}} & request_wstrb[mux*4 +: 4]);
+            master_kind = master_kind | ({2{grant[mux]}} & request_kind[mux*2 +: 2]);
+        end
+    end
+
+    genvar hart;
+    generate for (hart = 0; hart < NUM_HARTS; hart = hart + 1) begin : responses
+        assign request_ready[hart] = completed && grant[hart];
+        assign request_error[hart] = selected_valid && master_error && grant[hart];
+        assign request_rdata[hart*32 +: 32] = master_rdata;
+        assign reservation_invalidate[hart] = committed_write && !grant[hart];
+    end endgenerate
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            busy <= 0;
+            grant <= 0;
+            owner <= 0;
+            last_owner <= NUM_HARTS - 1;
+        end else if (!busy) begin
+            if (found) begin
+                grant <= {{(NUM_HARTS-1){1'b0}}, 1'b1} << next_owner;
+                owner <= next_owner;
+                busy <= 1;
+            end
+        end else if (!request_lock[owner] && (!request_valid[owner] || completed)) begin
+            busy <= 0;
+            if (completed) begin
+                last_owner <= owner;
+            end
+        end
+    end
+endmodule
+
 module Platform #(
     parameter MEM_WORDS = 8192,
     parameter MEM_INIT_FILE = "",
-    parameter ROM = 0
+    parameter ROM = 0,
+    parameter NUM_HARTS = 1
 ) (
     input clk,
     input reset,
@@ -2861,10 +3229,10 @@ module Platform #(
     output spi1_mosi,
     input spi1_miso,
     output spi1_cs_n,
-    output irq_machine,
-    output irq_supervisor,
-    output irq_software,
-    output irq_timer,
+    output [NUM_HARTS-1:0] irq_machine,
+    output [NUM_HARTS-1:0] irq_supervisor,
+    output [NUM_HARTS-1:0] irq_software,
+    output [NUM_HARTS-1:0] irq_timer,
     output [63:0] time_value
 );
 
@@ -2885,6 +3253,10 @@ module Platform #(
     wire bad = address[33:32] != 0 || a[1:0] != 0 || kind == 3 ||
                (!ram_sel && !ddr_sel && !mmio_sel) ||
                (kind != 0 && (mmio_sel || write)) || (ROM && ram_sel && write);
+
+    wire data_aligned = address[33:32] == 0 && a[1:0] == 0;
+    wire memory_data_valid = data_aligned && kind != 3 && (kind == 0 || !write);
+    wire mmio_data_valid = data_aligned && kind == 0;
 
     reg ram_read_pending;
     wire [31:0] ram_data;
@@ -2923,28 +3295,15 @@ module Platform #(
     end
 
     always @(*) begin
-        rdata = 0;
-        if (!bad) begin
-            if (ram_sel) begin
-                rdata = ram_data;
-            end else if (ddr_sel) begin
-                rdata = ddr_rdata;
-            end else if (gpio_sel) begin
-                rdata = gpio_data;
-            end else if (uart0_sel) begin
-                rdata = uart0_data;
-            end else if (uart1_sel) begin
-                rdata = uart1_data;
-            end else if (spi0_sel) begin
-                rdata = spi0_data;
-            end else if (spi1_sel) begin
-                rdata = spi1_data;
-            end else if (clint_sel) begin
-                rdata = clint_data;
-            end else if (plic_sel) begin
-                rdata = plic_data;
-            end
-        end
+        rdata = ({32{memory_data_valid && !(ROM && write) && ram_sel}} & ram_data) |
+            ({32{memory_data_valid && ddr_sel}} & ddr_rdata) |
+            ({32{mmio_data_valid && gpio_sel}} & gpio_data) |
+            ({32{mmio_data_valid && uart0_sel}} & uart0_data) |
+            ({32{mmio_data_valid && uart1_sel}} & uart1_data) |
+            ({32{mmio_data_valid && spi0_sel}} & spi0_data) |
+            ({32{mmio_data_valid && spi1_sel}} & spi1_data) |
+            ({32{mmio_data_valid && clint_sel}} & clint_data) |
+            ({32{mmio_data_valid && plic_sel}} & plic_data);
     end
 
     Sram #(
@@ -3035,7 +3394,9 @@ module Platform #(
         .read_data(spi1_data)
     );
 
-    Clint clint (
+    Clint #(
+        .NUM_HARTS(NUM_HARTS)
+    ) clint (
         .clk(clk),
         .reset(reset),
         .address(a),
@@ -3048,7 +3409,9 @@ module Platform #(
         .time_value(time_value)
     );
     
-    Plic plic (
+    Plic #(
+        .NUM_HARTS(NUM_HARTS)
+    ) plic (
         .clk(clk),
         .reset(reset),
         .irq_sources({gpio_irq, uart1_irq, uart0_irq}),
@@ -3219,6 +3582,7 @@ endmodule
 
 module Plic #(
     parameter NUM_SOURCES = 34,
+    parameter NUM_HARTS = 1,
     parameter [31:0] BASE_ADDRESS = 32'h0c000000
 ) (
     input clk,
@@ -3230,38 +3594,43 @@ module Plic #(
     input write_enable,
     input read_commit,
     output reg [31:0] read_data,
-    output irq_machine,
-    output irq_supervisor
+    output [NUM_HARTS-1:0] irq_machine,
+    output [NUM_HARTS-1:0] irq_supervisor
 );
     localparam ID_BITS = $clog2(NUM_SOURCES + 1);
+    localparam NUM_CONTEXTS = 2 * NUM_HARTS;
+    localparam CONTEXT_BITS = $clog2(NUM_CONTEXTS) > 0 ? $clog2(NUM_CONTEXTS) : 1;
 
     wire [31:0] offset = {address[31:2], 2'b00} - BASE_ADDRESS;
     wire in_range = address >= BASE_ADDRESS && offset < 32'h04000000;
 
     reg [2:0] priorities[1:NUM_SOURCES];
-    reg [NUM_SOURCES:1] enables[0:1];
-    reg [2:0] thresholds[0:1];
+    reg [NUM_CONTEXTS*NUM_SOURCES-1:0] enables;
+    reg [NUM_CONTEXTS*3-1:0] thresholds;
     reg [NUM_SOURCES:1] pending;
     reg [NUM_SOURCES:1] in_service;
-    reg [NUM_SOURCES:1] owner;
+    reg [NUM_SOURCES*CONTEXT_BITS-1:0] owner;
 
-    wire [ID_BITS-1:0] selected[0:1];
+    wire [ID_BITS-1:0] selected[0:NUM_CONTEXTS-1];
     localparam TREE_LEAVES = 1 << $clog2(NUM_SOURCES);
-    wire [NUM_SOURCES:1] eligible[0:1];
+    wire [NUM_SOURCES:1] eligible[0:NUM_CONTEXTS-1];
 
     integer rc;
     integer rs;
     integer wc;
     integer ws;
 
-    assign irq_machine = |eligible[0];
-    assign irq_supervisor = |eligible[1];
+    genvar hart_id;
+    generate for (hart_id = 0; hart_id < NUM_HARTS; hart_id = hart_id + 1) begin : hart_irqs
+        assign irq_machine[hart_id] = |eligible[2*hart_id];
+        assign irq_supervisor[hart_id] = |eligible[2*hart_id+1];
+    end endgenerate
 
     genvar context_id;
     genvar node;
 
     generate
-        for (context_id = 0; context_id < 2; context_id = context_id + 1) begin : contexts
+        for (context_id = 0; context_id < NUM_CONTEXTS; context_id = context_id + 1) begin : contexts
             wire [ID_BITS+2:0] winner[1:2*TREE_LEAVES-1];
 
             for (node = 0; node < TREE_LEAVES; node = node + 1) begin : leaves
@@ -3269,8 +3638,8 @@ module Plic #(
                     localparam [ID_BITS-1:0] SOURCE_ID = node + 1;
 
                     assign eligible[context_id][node+1] = pending[node+1] &&
-                        !in_service[node+1] && enables[context_id][node+1] &&
-                        priorities[node+1] > thresholds[context_id];
+                        !in_service[node+1] && enables[context_id*NUM_SOURCES+node] &&
+                        priorities[node+1] > thresholds[context_id*3 +: 3];
                     assign winner[TREE_LEAVES+node] = eligible[context_id][node+1] ? {priorities[node+1], SOURCE_ID} : 0;
                 end else begin : padding
                     assign winner[TREE_LEAVES+node] = 0;
@@ -3291,27 +3660,27 @@ module Plic #(
         if (in_range) begin
             for (rs = 1; rs <= NUM_SOURCES; rs = rs + 1) begin
                 if (offset == rs * 4) begin
-                    read_data = {29'd0, priorities[rs]};
+                    read_data = read_data | {29'd0, priorities[rs]};
                 end
 
                 if (offset == 32'h1000 + (rs / 32) * 4) begin
-                    read_data[rs % 32] = pending[rs];
+                    read_data[rs % 32] = read_data[rs % 32] | pending[rs];
                 end
             end
 
-            for (rc = 0; rc < 2; rc = rc + 1) begin
+            for (rc = 0; rc < NUM_CONTEXTS; rc = rc + 1) begin
                 for (rs = 1; rs <= NUM_SOURCES; rs = rs + 1) begin
                     if (offset == 32'h2000 + rc * 32'h80 + (rs / 32) * 4) begin
-                        read_data[rs % 32] = enables[rc][rs];
+                        read_data[rs % 32] = read_data[rs % 32] | enables[rc*NUM_SOURCES+rs-1];
                     end
                 end
 
                 if (offset == 32'h200000 + rc * 32'h1000) begin
-                    read_data = {29'd0, thresholds[rc]};
+                    read_data = read_data | {29'd0, thresholds[rc*3 +: 3]};
                 end
 
                 if (offset == 32'h200004 + rc * 32'h1000) begin
-                    read_data = selected[rc];
+                    read_data = read_data | selected[rc];
                 end
             end
         end
@@ -3321,11 +3690,9 @@ module Plic #(
         if (reset) begin
             pending <= 0;
             in_service <= 0;
+            enables <= 0;
+            thresholds <= 0;
             owner <= 0;
-            for (wc = 0; wc < 2; wc = wc + 1) begin
-                enables[wc] <= 0;
-                thresholds[wc] <= 0;
-            end
 
             for (ws = 1; ws <= NUM_SOURCES; ws = ws + 1) begin
                 priorities[ws] <= 0;
@@ -3334,28 +3701,32 @@ module Plic #(
             pending <= pending | (irq_sources & ~in_service);
 
             if (in_range) begin
-                for (wc = 0; wc < 2; wc = wc + 1) begin
+                for (wc = 0; wc < NUM_CONTEXTS; wc = wc + 1) begin
                     if (read_commit && offset == 32'h200004 + wc * 32'h1000 && selected[wc] != 0) begin
-                        pending[selected[wc]] <= 0;
-                        in_service[selected[wc]] <= 1;
-                        owner[selected[wc]] <= wc != 0;
+                        for (ws = 1; ws <= NUM_SOURCES; ws = ws + 1) begin
+                            if (selected[wc] == ws) begin
+                                pending[ws] <= 0;
+                                in_service[ws] <= 1;
+                                owner[(ws-1)*CONTEXT_BITS +: CONTEXT_BITS] <= wc[CONTEXT_BITS-1:0];
+                            end
+                        end
                     end
 
                     if (write_enable) begin
                         if (offset == 32'h200000 + wc * 32'h1000 && write_mask[0]) begin
-                            thresholds[wc] <= write_data[2:0];
+                            thresholds[wc*3 +: 3] <= write_data[2:0];
                         end
 
                         for (ws = 1; ws <= NUM_SOURCES; ws = ws + 1) begin
                             if (offset == 32'h200004 + wc * 32'h1000 &&
                                 write_mask[0] && write_data == ws &&
-                                in_service[ws] && owner[ws] == (wc != 0) &&
-                                enables[wc][ws]) begin
+                                in_service[ws] && owner[(ws-1)*CONTEXT_BITS +: CONTEXT_BITS] == wc[CONTEXT_BITS-1:0] &&
+                                enables[wc*NUM_SOURCES+ws-1]) begin
                                 in_service[ws] <= 0;
                             end
 
                             if (offset == 32'h2000 + wc * 32'h80 + (ws / 32) * 4 && write_mask[(ws % 32) / 8]) begin
-                                enables[wc][ws] <= write_data[ws % 32];
+                                enables[wc*NUM_SOURCES+ws-1] <= write_data[ws % 32];
                             end
                         end
                     end
