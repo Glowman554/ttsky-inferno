@@ -2494,6 +2494,7 @@ module Clint #(
     reg [63:0] mtimecmp[0:NUM_HARTS-1];
     integer lane;
     integer hart;
+    integer read_hart;
     integer reset_hart;
 
     assign irq_software = msip;
@@ -2513,17 +2514,17 @@ module Clint #(
             read_data = read_data | mtime[63:32];
         end
 
-        for (hart = 0; hart < NUM_HARTS; hart = hart + 1) begin
-            if (word_address == BASE_ADDRESS + hart * 4) begin
-                read_data = read_data | {31'd0, msip[hart]};
+        for (read_hart = 0; read_hart < NUM_HARTS; read_hart = read_hart + 1) begin
+            if (word_address == BASE_ADDRESS + read_hart * 4) begin
+                read_data = read_data | {31'd0, msip[read_hart]};
             end
 
-            if (word_address == BASE_ADDRESS + 32'h4000 + hart * 8) begin
-                read_data = read_data | mtimecmp[hart][31:0];
+            if (word_address == BASE_ADDRESS + 32'h4000 + read_hart * 8) begin
+                read_data = read_data | mtimecmp[read_hart][31:0];
             end
 
-            if (word_address == BASE_ADDRESS + 32'h4004 + hart * 8) begin
-                read_data = read_data | mtimecmp[hart][63:32];
+            if (word_address == BASE_ADDRESS + 32'h4004 + read_hart * 8) begin
+                read_data = read_data | mtimecmp[read_hart][63:32];
             end
         end
     end
