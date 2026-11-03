@@ -53,15 +53,16 @@ module tt_um_toxicfox_inferno (
         .wdata(wdata),
         .wstrb(wstrb),
         .kind(kind),
-        .ready(ready), 
-        .rdata(rdata), 
+        .ready(ready),
+        .rdata(rdata),
         .error(error),
-        .irq_machine(irq_machine), 
+        .irq_machine(irq_machine),
         .irq_supervisor(irq_supervisor),
-        .irq_software(irq_software), 
+        .irq_software(irq_software),
         .irq_timer(irq_timer),
-        .time_value(time_value), 
+        .time_value(time_value),
         .reservation_invalidate(1'b0),
+        .reservation_write_address(34'd0),
         .atomic_lock(),
         .retire_valid(retire_valid),
         .trap_valid(trap_valid)
@@ -112,7 +113,8 @@ endmodule
 `default_nettype wire
 
 module BareMemory #(
-    parameter MEM_WORDS = 8192
+    parameter HMEM_WORDS = 33554432,
+    parameter LMEM_WORDS = 8192
 ) (
     input clk,
     input reset,
@@ -144,13 +146,13 @@ module BareMemory #(
     input error
 );
     wire [33:0] physical_address = {2'b00, req_address};
-    wire ram_address = req_address < MEM_WORDS * 4 ||
-        (req_address >= 32'h40000000 && req_address < 32'h48000000);
+    wire ram_address = req_address < LMEM_WORDS * 4 ||
+        (req_address >= 32'h40000000 && req_address < (34'h040000000 + HMEM_WORDS * 34'd4));
 
     reg sc_invalidated;
     wire sc_failed = req_sc && (!sc_reserved_valid || sc_invalidated ||
         reservation_invalidate || sc_reserved_address != {physical_address[33:2], 2'b00});
-    
+
     localparam IDLE = 2'd0;
     localparam ACCESS = 2'd1;
     localparam RESPONSE = 2'd2;
@@ -165,7 +167,7 @@ module BareMemory #(
     assign write = req_write;
     assign wdata = req_wdata;
     assign wstrb = req_write ? req_wstrb : 4'd0;
-    
+
     assign kind = req_kind;
     assign req_ready = !reset && state == RESPONSE && req_valid;
     assign req_page_fault = 1'b0;
@@ -191,7 +193,7 @@ module BareMemory #(
                     if (req_sc && reservation_invalidate) begin
                         sc_invalidated <= 1;
                     end
-                    
+
                     if (denied) begin
                         req_error <= 1;
                         state <= RESPONSE;
@@ -220,7 +222,8 @@ endmodule
 module RiscV #(
     parameter [31:0] RESET_PC = 0,
     parameter TLB_ENTRIES = 2048,
-    parameter MEM_WORDS = 8192,
+    parameter HMEM_WORDS = 33554432,
+    parameter LMEM_WORDS = 8192,
     parameter ENABLE_MMU = 1,
     parameter [31:0] HART_ID = 0,
     parameter ICACHE_WORDS = 0
@@ -242,6 +245,7 @@ module RiscV #(
     input irq_supervisor,
     input [63:0] time_value,
     input reservation_invalidate,
+    input [33:0] reservation_write_address,
     output atomic_lock,
     output [1:0] privilege,
     output [1:0] data_privilege,
@@ -261,6 +265,7 @@ module RiscV #(
 );
     wire clear_reservation;
     wire interrupt_pending;
+    wire wfi_resume;
     wire csr_valid;
     wire csr_commit;
     wire csr_source_zero;
@@ -291,6 +296,9 @@ module RiscV #(
     wire [33:0] engine_address;
     wire [33:0] translated_address;
     wire [33:0] sc_reserved_address;
+    wire [33:0] reservation_address;
+    wire reservation_conflict = reservation_invalidate && reservation_write_address[33:2] == reservation_address[33:2];
+    wire sc_conflict = reservation_invalidate && reservation_write_address[33:2] == sc_reserved_address[33:2];
     wire [31:0] engine_rdata;
     wire [31:0] engine_wdata;
     wire [3:0] engine_wstrb;
@@ -320,7 +328,8 @@ module RiscV #(
     generate if (ENABLE_MMU) begin : translated_memory
     Mmu #(
         .TLB_ENTRIES(TLB_ENTRIES),
-        .MEM_WORDS(MEM_WORDS)
+        .HMEM_WORDS(HMEM_WORDS),
+        .LMEM_WORDS(LMEM_WORDS)
     ) memory (
         .clk(clk),
         .reset(reset),
@@ -337,7 +346,7 @@ module RiscV #(
         .req_sc(access_sc),
         .sc_reserved_valid(sc_reserved_valid),
         .sc_reserved_address(sc_reserved_address),
-        .reservation_invalidate(reservation_invalidate),
+        .reservation_invalidate(sc_conflict),
         .req_privilege(engine_kind == 1 ? privilege : data_privilege),
         .satp(satp_value),
         .sum(status_value[18]),
@@ -362,7 +371,8 @@ module RiscV #(
     );
     end else begin : direct_memory
     BareMemory #(
-        .MEM_WORDS(MEM_WORDS)
+        .HMEM_WORDS(HMEM_WORDS),
+        .LMEM_WORDS(LMEM_WORDS)
     ) memory (
         .clk(clk),
         .reset(reset),
@@ -376,7 +386,7 @@ module RiscV #(
         .req_sc(access_sc),
         .sc_reserved_valid(sc_reserved_valid),
         .sc_reserved_address(sc_reserved_address),
-        .reservation_invalidate(reservation_invalidate),
+        .reservation_invalidate(sc_conflict),
         .req_ready(engine_ready),
         .req_rdata(engine_rdata),
         .req_error(engine_error),
@@ -398,7 +408,8 @@ module RiscV #(
     generate if (ICACHE_WORDS > 0) begin : cached_instructions
         InstructionCache #(
             .CACHE_WORDS(ICACHE_WORDS),
-            .MEM_WORDS(MEM_WORDS)
+            .HMEM_WORDS(HMEM_WORDS),
+            .LMEM_WORDS(LMEM_WORDS)
         ) cache (
             .clk(clk),
             .reset(reset),
@@ -456,13 +467,15 @@ module RiscV #(
         .access_sc(access_sc),
         .sc_reserved_valid(sc_reserved_valid),
         .sc_reserved_address(sc_reserved_address),
+        .reservation_address(reservation_address),
         .translated_address(translated_address),
         .sc_success(sc_success),
         .privilege(privilege),
         .clear_reservation(clear_reservation),
         .fence_i_commit(fence_i_commit),
-        .reservation_invalidate(reservation_invalidate),
+        .reservation_invalidate(reservation_conflict),
         .interrupt_pending(interrupt_pending),
+        .wfi_resume(wfi_resume),
         .interrupt_cause(interrupt_cause),
         .csr_valid(csr_valid),
         .csr_commit(csr_commit),
@@ -527,6 +540,7 @@ module RiscV #(
         .retired(retire_valid),
         .privilege(privilege),
         .interrupt_pending(interrupt_pending),
+        .wfi_resume(wfi_resume),
         .interrupt_cause(interrupt_cause),
         .satp_value(satp_value),
         .status_value(status_value),
@@ -571,6 +585,7 @@ module CsrFile #(
     input retired,
     output reg [1:0] privilege,
     output reg interrupt_pending,
+    output wfi_resume,
     output reg [4:0] interrupt_cause,
     output [31:0] satp_value,
     output [31:0] status_value,
@@ -745,6 +760,7 @@ module CsrFile #(
     end
 
     wire [31:0] machine_eligible = (privilege != 3 || mstatus[3]) ? (mie & mip & ~mideleg) : 32'd0;
+    assign wfi_resume = |(mie & mip);
     wire [31:0] supervisor_eligible = (privilege == 0 || (privilege == 1 && mstatus[1])) ? (mie & mip & mideleg) : 32'd0;
     wire [31:0] eligible = machine_eligible != 0 ? machine_eligible : supervisor_eligible;
 
@@ -1051,6 +1067,7 @@ module ExecutionUnit #(
     output access_sc,
     output reg sc_reserved_valid,
     output reg [33:0] sc_reserved_address,
+    output reg [33:0] reservation_address,
     input [33:0] translated_address,
     input sc_success,
     input page_fault,
@@ -1062,6 +1079,7 @@ module ExecutionUnit #(
     output fence_i_commit,
     input reservation_invalidate,
     input interrupt_pending,
+    input wfi_resume,
     input [4:0] interrupt_cause,
     output csr_valid,
     output csr_commit,
@@ -1099,6 +1117,7 @@ module ExecutionUnit #(
     localparam ATOMIC_WRITE = 6;
     localparam BOUNDARY = 7;
     localparam FETCH_HIGH = 8;
+    localparam WAIT_INTERRUPT = 9;
 
     reg [3:0] state;
     reg [31:0] instruction;
@@ -1127,7 +1146,7 @@ module ExecutionUnit #(
 
     wire register_arithmetic = instruction[6:0] == 7'h33;
     wire subtract = register_arithmetic && funct3 == 0 && funct7 == 7'h20;
-    
+
     wire [31:0] add_operand = register_arithmetic ? b : instruction[6:0] == 7'h23 ? imm_s : imm_i;
     wire [31:0] data_sum = a + (add_operand ^ {32{subtract}}) + subtract;
 
@@ -1180,7 +1199,6 @@ module ExecutionUnit #(
     reg reservation_valid;
 
     reg [1:0] previous_privilege;
-    reg [33:0] reservation_address;
     reg [31:0] atomic_old;
     reg [4:0] atomic_operation;
     reg [31:0] atomic_updated;
@@ -1608,6 +1626,9 @@ module ExecutionUnit #(
                             end
 
                             retire(next_pc, 0, 0, 0);
+                            if (decoded_system == 3) begin
+                                state <= WAIT_INTERRUPT;
+                            end
                         end
                     end else if (ecall) begin
                         raise_trap(privilege == 0 ? 8 : privilege == 1 ? 9 : 11, 0);
@@ -1674,6 +1695,12 @@ module ExecutionUnit #(
                     end
                 end
 
+                WAIT_INTERRUPT: begin
+                    if (wfi_resume) begin
+                        state <= BOUNDARY;
+                    end
+                end
+
                 MULDIV: begin
                     if (muldiv_done) begin
                         retire(seq_pc, 1, rd, muldiv_result);
@@ -1718,7 +1745,8 @@ endmodule
 
 module InstructionCache #(
     parameter CACHE_WORDS = 256,
-    parameter MEM_WORDS = 8192
+    parameter HMEM_WORDS = 33554432,
+    parameter LMEM_WORDS = 8192
 ) (
     input clk,
     input reset,
@@ -1745,17 +1773,17 @@ module InstructionCache #(
     localparam INDEX_BITS = CACHE_WORDS > 1 ? $clog2(CACHE_WORDS) : 1;
     wire [INDEX_BITS-1:0] index = CACHE_WORDS > 1 ? address[INDEX_BITS+1:2] : 0;
     wire cacheable = kind == 2'd1 && !write && address[33:32] == 0 &&
-        (address[31:0] < MEM_WORDS * 4 ||
-         (address[31:0] >= 32'h40000000 && address[31:0] < 32'h48000000));
+        (address[31:0] < LMEM_WORDS * 4 ||
+         (address[31:0] >= 32'h40000000 && address[31:0] < (34'h040000000 + HMEM_WORDS * 34'd4)));
 
     reg [CACHE_WORDS-1:0] valid_bits;
     (* ram_style = "block", syn_ramstyle = "block_ram" *) reg [63:0] lines[0:CACHE_WORDS-1];
-    
+
     reg [63:0] lookup_line;
     reg lookup_valid;
     reg lookup_pending;
     reg [33:0] lookup_address;
-    
+
     wire [INDEX_BITS-1:0] lookup_index = CACHE_WORDS > 1 ? lookup_address[INDEX_BITS+1:2] : 0;
 
     wire hit = lookup_pending && lookup_valid && lookup_line[63:32] == lookup_address[33:2];
@@ -1815,7 +1843,8 @@ endmodule
 
 module Mmu #(
     parameter TLB_ENTRIES = 2048,
-    parameter MEM_WORDS = 8192
+    parameter HMEM_WORDS = 33554432,
+    parameter LMEM_WORDS = 8192
 ) (
     input clk,
     input reset,
@@ -1884,11 +1913,14 @@ module Mmu #(
     reg permit_sum;
     reg permit_mxr;
     reg level;
+    reg [31:0] walk_data;
+    reg walk_bus_error;
+    reg walk_result_pending;
 
     wire fetch = access_kind == 1;
     wire needs_write = store || rmw || sc;
-    wire leaf = rdata[1] || rdata[3];
-    wire pte_invalid = !rdata[0] || (!rdata[1] && rdata[2]);
+    wire leaf = walk_data[1] || walk_data[3];
+    wire pte_invalid = !walk_data[0] || (!walk_data[1] && walk_data[2]);
 
     function page_denied(input [7:0] flags, input [1:0] privilege_mode, input instruction_access, input write_needed, input read_needed,
                          input allow_user_data, input allow_execute_read);
@@ -1902,11 +1934,11 @@ module Mmu #(
         end
     endfunction
 
-    wire leaf_fault = page_denied(rdata[7:0], mode, fetch, needs_write, !store || rmw, permit_sum, permit_mxr) ||
-        (level && rdata[19:10] != 0);
+    wire leaf_fault = page_denied(walk_data[7:0], mode, fetch, needs_write, !store || rmw, permit_sum, permit_mxr) ||
+        (level && walk_data[19:10] != 0);
 
-    wire walk_page_fault = pte_invalid || (leaf ? leaf_fault : (!level || rdata[7:6] != 0 || rdata[4]));
-    wire walk_error = error || walk_page_fault;
+    wire walk_page_fault = pte_invalid || (leaf ? leaf_fault : (!level || walk_data[7:6] != 0 || walk_data[4]));
+    wire walk_error = walk_bus_error || walk_page_fault;
 
     localparam TLB_STORAGE = TLB_ENTRIES > 0 ? TLB_ENTRIES : 1;
     localparam TLB_INDEX_BITS = TLB_ENTRIES > 1 ? $clog2(TLB_ENTRIES) : 1;
@@ -1935,14 +1967,14 @@ module Mmu #(
 
     wire [TLB_INDEX_BITS-1:0] lookup_index = cache_index(req_address[31:12]);
     wire [TLB_INDEX_BITS-1:0] fill_index = cache_index(va[31:12]);
-    wire [21:0] leaf_ppn = level ? {rdata[31:20], va[21:12]} : rdata[31:10];
-    wire fill = TLB_ENTRIES > 0 && state == WALK && ready && !error &&
+    wire [21:0] leaf_ppn = level ? {walk_data[31:20], va[21:12]} : walk_data[31:10];
+    wire fill = TLB_ENTRIES > 0 && state == ACCESS_CHECK && walk_result_pending && !walk_bus_error &&
         !pte_invalid && leaf && !leaf_fault && !invalidate &&
         !discard_fill && !tlb_clearing && walk_satp == satp;
 
     always @(posedge clk) begin
         fill_pending <= !reset && fill;
-        fill_record <= {tlb_generation, va[31:12], leaf_ppn, rdata[7:0]};
+        fill_record <= {tlb_generation, va[31:12], leaf_ppn, walk_data[7:0]};
 
         if (!reset && !tlb_clearing && state == IDLE && req_valid && TLB_ENTRIES > 0) begin
             tlb_record <= tlb_mem[lookup_index];
@@ -1964,7 +1996,7 @@ module Mmu #(
     wire pmp_allowed;
 
     function is_ram(input [33:0] a);
-        is_ram = a[33:32] == 0 && (a < MEM_WORDS * 4 || (a >= 34'h040000000 && a < 34'h048000000));
+        is_ram = a[33:32] == 0 && (a < LMEM_WORDS * 4 || (a >= 34'h040000000 && a < (34'h040000000 + HMEM_WORDS * 34'd4)));
     endfunction
 
     wire walk_denied = !pmp_allowed || !is_ram(pte_address);
@@ -2024,6 +2056,9 @@ module Mmu #(
             permit_sum <= 0;
             permit_mxr <= 0;
             level <= 1;
+            walk_data <= 0;
+            walk_bus_error <= 0;
+            walk_result_pending <= 0;
             req_rdata <= 0;
             req_error <= 0;
             req_page_fault <= 0;
@@ -2038,7 +2073,7 @@ module Mmu #(
             if (sc && reservation_invalidate && state != IDLE) begin
                 sc_invalidated <= 1;
             end
-            
+
             cached_satp <= satp;
 
             if (tlb_clearing) begin
@@ -2089,6 +2124,7 @@ module Mmu #(
                         req_error <= 0;
                         req_page_fault <= 0;
                         sc_success <= 0;
+                        walk_result_pending <= 0;
 
                         if (req_privilege == 3 || !satp[31]) begin
                             pa <= {2'd0, req_address};
@@ -2119,8 +2155,14 @@ module Mmu #(
                 end
 
                 WALK_CHECK: begin
+                    walk_result_pending <= 0;
+                    if (walk_result_pending) begin
+                        level <= 0;
+                    end
                     bus_address <= pte_address;
-                    if (walk_denied) begin
+                    if (walk_result_pending && walk_error) begin
+                        fault(!walk_bus_error && walk_page_fault);
+                    end else if (walk_denied) begin
                         fault(0);
                     end else begin
                         state <= WALK;
@@ -2129,25 +2171,21 @@ module Mmu #(
 
                 WALK: begin
                     if (ready) begin
+                        walk_data <= rdata;
+                        walk_bus_error <= error;
+                        walk_result_pending <= 1;
                         pa <= level ? {rdata[31:20], va[21:0]} : {rdata[31:10], va[11:0]};
                         pte_address <= {rdata[31:10], va[21:12], 2'b0};
-                        req_error <= walk_error;
-                        req_page_fault <= !error && walk_page_fault;
-                        sc_success <= 0;
-                        if (walk_error) begin
-                            state <= RESPONSE;
-                        end else if (leaf) begin
-                            state <= ACCESS_CHECK;
-                        end else begin
-                            level <= 0;
-                            state <= WALK_CHECK;
-                        end
+                        state <= (rdata[1] || rdata[3]) ? ACCESS_CHECK : WALK_CHECK;
                     end
                 end
 
                 ACCESS_CHECK: begin
+                    walk_result_pending <= 0;
                     bus_address <= {pa[33:2], 2'b0};
-                    if (access_denied) begin
+                    if (walk_result_pending && walk_error) begin
+                        fault(!walk_bus_error && walk_page_fault);
+                    end else if (access_denied) begin
                         fault(0);
                     end else if (sc_failed) begin
                         sc_success <= 0;
@@ -2332,7 +2370,7 @@ module PmpRegisters (
         end
 
         if (address == 12'h3a2 || address == 12'h3a3 || (address >= 12'h3b8 && address <= 12'h3bf)) begin
-            known = 1; 
+            known = 1;
         end
 
         for (j = 0; j < 8; j = j + 1) begin
@@ -2544,7 +2582,7 @@ module Clint #(
                         msip[hart] <= write_data[0];
                     end
                 end
-                
+
                 for (lane = 0; lane < 4; lane = lane + 1) begin
                     if (write_mask[lane]) begin
                         for (hart = 0; hart < NUM_HARTS; hart = hart + 1) begin
@@ -2571,7 +2609,169 @@ module Clint #(
     end
 endmodule
 
+module DdrBridge #(
+    parameter DDR_DATA_WIDTH = 128,
+    parameter DDR_ADDR_WIDTH = DDR_DATA_WIDTH == 256 ? 29 : 28
+) (
+    input clk,
+    input reset,
+
+    input start,
+    input clear,
+    input write,
+    input [29:0] address,
+    input [31:0] write_data,
+    input [3:0] write_mask,
+    output [31:0] read_data,
+    output reg [DDR_DATA_WIDTH-1:0] read_line,
+    output reg done,
+
+    input ddr_clk,
+    input ddr_calib,
+    input ddr_cmd_ready,
+    output [2:0] ddr_cmd,
+    output ddr_cmd_en,
+    output [DDR_ADDR_WIDTH-1:0] ddr_addr,
+    input ddr_wr_data_rdy,
+    output [DDR_DATA_WIDTH-1:0] ddr_wr_data,
+    output ddr_wr_data_en,
+    output ddr_wr_data_end,
+    output [DDR_DATA_WIDTH/8-1:0] ddr_wr_data_mask,
+    input [DDR_DATA_WIDTH-1:0] ddr_rd_data,
+    input ddr_rd_data_valid
+);
+    localparam OFFSET_BITS = $clog2(DDR_DATA_WIDTH/8);
+    localparam CMD_WRITE = 3'd0;
+    localparam CMD_READ = 3'd1;
+
+    // ----------------------- core domain -----------------------
+    reg req_toggle;
+    reg pending;
+    reg req_write;
+    reg [29:0] req_address;
+    reg [31:0] req_data;
+    reg [3:0] req_mask;
+
+    reg [DDR_DATA_WIDTH-1:0] ddr_result;
+    reg ack_toggle;
+
+    (* async_reg = "true" *) reg [2:0] ack_sync;
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            req_toggle <= 0;
+            pending <= 0;
+            done <= 0;
+            req_write <= 0;
+            req_address <= 0;
+            req_data <= 0;
+            req_mask <= 0;
+            read_line <= 0;
+            ack_sync <= 0;
+        end else begin
+            ack_sync <= {ack_sync[1:0], ack_toggle};
+
+            if (start && !pending && !done) begin
+                req_write <= write;
+                req_address <= address;
+                req_data <= write_data;
+                req_mask <= write_mask;
+                req_toggle <= !req_toggle;
+                pending <= 1;
+            end
+
+            if (pending && (ack_sync[2] != ack_sync[1])) begin
+                read_line <= ddr_result;
+                pending <= 0;
+                done <= 1;
+            end
+
+            if (clear) begin
+                done <= 0;
+            end
+        end
+    end
+
+    assign read_data = read_line[req_address[OFFSET_BITS-1:2]*32 +: 32];
+
+    // ----------------------- DDR domain -----------------------
+    wire [29:0] word = req_address >> $clog2(DDR_DATA_WIDTH/64);
+    assign ddr_addr = {1'b0, word[12:10], word[DDR_ADDR_WIDTH-2:13], word[9:3], 3'b000};
+    wire [OFFSET_BITS-3:0] lane = req_address[OFFSET_BITS-1:2];
+    assign ddr_wr_data = {(DDR_DATA_WIDTH/32){req_data}};
+    assign ddr_wr_data_mask = ~({{(DDR_DATA_WIDTH/8-4){1'b0}}, req_mask} << (lane * 4));
+
+    (* async_reg = "true" *) reg [2:0] req_sync;
+    (* async_reg = "true" *) reg [1:0] ddr_reset_sync;
+    wire ddr_reset = ddr_reset_sync[1];
+
+    reg write_pending;
+    reg command_pending;
+    reg reading;
+    reg calib_ready;
+
+    assign ddr_cmd = req_write ? CMD_WRITE : CMD_READ;
+    assign ddr_cmd_en = command_pending && calib_ready && ddr_cmd_ready;
+    assign ddr_wr_data_en = write_pending && calib_ready && ddr_wr_data_rdy;
+    assign ddr_wr_data_end = ddr_wr_data_en;
+
+    always @(posedge ddr_clk or posedge reset) begin
+        if (reset) begin
+            calib_ready <= 0;
+        end else begin
+            calib_ready <= ddr_calib;
+        end
+    end
+
+    always @(posedge ddr_clk or posedge reset) begin
+        if (reset) begin
+            ddr_reset_sync <= 2'b11;
+        end else begin
+            ddr_reset_sync <= {ddr_reset_sync[0], 1'b0};
+        end
+    end
+
+    always @(posedge ddr_clk) begin
+        if (ddr_reset) begin
+            req_sync <= 0;
+            ack_toggle <= 0;
+            write_pending <= 0;
+            command_pending <= 0;
+            reading <= 0;
+            ddr_result <= 0;
+        end else begin
+            req_sync <= {req_sync[1:0], req_toggle};
+
+            if (req_sync[2] != req_sync[1]) begin
+                write_pending <= req_write;
+                command_pending <= !req_write;
+            end
+
+            if (ddr_wr_data_en) begin
+                write_pending <= 0;
+                command_pending <= 1;
+            end
+
+            if (ddr_cmd_en) begin
+                command_pending <= 0;
+                if (req_write) begin
+                    ack_toggle <= !ack_toggle;
+                end else begin
+                    reading <= 1;
+                end
+            end
+
+            if (reading && ddr_rd_data_valid) begin
+                ddr_result <= ddr_rd_data;
+                reading <= 0;
+                ack_toggle <= !ack_toggle;
+            end
+        end
+    end
+endmodule
+
 module DdrAdapter #(
+    parameter HMEM_WORDS = 33554432,
     parameter DDR_DATA_WIDTH = 128,
     parameter DDR_ADDR_WIDTH = DDR_DATA_WIDTH == 256 ? 29 : 28,
     parameter CACHE_BYTES = 4096
@@ -2603,7 +2803,7 @@ module DdrAdapter #(
     (* async_reg = "true" *) reg [1:0] calib_sync;
     reg cooldown;
     wire done;
-    wire bad = address[33:32] != 0 || address[31:0] < 32'h40000000 || address[31:0] >= 32'h48000000 || address[1:0] != 0;
+    wire bad = address[33:32] != 0 || address[31:0] < 32'h40000000 || address >= (34'h040000000 + HMEM_WORDS * 34'd4) || address[1:0] != 0;
 
     wire bridge_reset = reset || !calib_sync[1];
     wire start = valid && !bad && !bridge_reset && !cooldown;
@@ -2623,7 +2823,7 @@ module DdrAdapter #(
     wire mem_start;
     wire mem_clear;
     wire mem_write;
-    wire [27:0] mem_address;
+    wire [29:0] mem_address;
     wire [31:0] mem_write_data;
     wire [3:0] mem_write_mask;
     wire [DDR_DATA_WIDTH-1:0] mem_read_line;
@@ -2635,7 +2835,7 @@ module DdrAdapter #(
         .start(start),
         .clear(valid && ready),
         .write(write),
-        .address(address[27:0]),
+        .address(address[29:0]),
         .write_data(wdata),
         .write_mask(wstrb),
         .read_data(rdata),
@@ -2689,7 +2889,7 @@ module DdrCache #(
     input start,
     input clear,
     input write,
-    input [27:0] address,
+    input [29:0] address,
     input [31:0] write_data,
     input [3:0] write_mask,
     output [31:0] read_data,
@@ -2699,7 +2899,7 @@ module DdrCache #(
     output mem_start,
     output mem_clear,
     output mem_write,
-    output [27:0] mem_address,
+    output [29:0] mem_address,
     output [31:0] mem_write_data,
     output [3:0] mem_write_mask,
     input [DDR_DATA_WIDTH-1:0] mem_read_line,
@@ -2710,7 +2910,7 @@ module DdrCache #(
     localparam LINE_COUNT = CACHE_BYTES / LINE_BYTES;
     localparam INDEX_BITS = $clog2(LINE_COUNT);
     localparam INDEX_WIDTH = INDEX_BITS == 0 ? 1 : INDEX_BITS;
-    localparam TAG_BITS = 28 - OFFSET_BITS - INDEX_BITS;
+    localparam TAG_BITS = 30 - OFFSET_BITS - INDEX_BITS;
 
     // synthesis translate_off
     initial begin
@@ -2724,7 +2924,7 @@ module DdrCache #(
     reg pending;
     reg lookup_pending;
     reg req_write;
-    reg [27:0] req_address;
+    reg [29:0] req_address;
     reg [31:0] req_data;
     reg [3:0] req_mask;
 
@@ -2735,7 +2935,7 @@ module DdrCache #(
 
     wire [INDEX_WIDTH-1:0] address_index = INDEX_BITS == 0 ? {INDEX_WIDTH{1'b0}} : address[INDEX_WIDTH+OFFSET_BITS-1:OFFSET_BITS];
     wire [INDEX_WIDTH-1:0] req_index = INDEX_BITS == 0 ? {INDEX_WIDTH{1'b0}} : req_address[INDEX_WIDTH+OFFSET_BITS-1:OFFSET_BITS];
-    wire [TAG_BITS-1:0] req_tag = req_address[27:INDEX_BITS+OFFSET_BITS];
+    wire [TAG_BITS-1:0] req_tag = req_address[29:INDEX_BITS+OFFSET_BITS];
 
     wire accept = start && !pending && !lookup_pending && !done;
     wire cache_hit = lookup_valid && lookup_tag == req_tag;
@@ -2839,158 +3039,6 @@ module DdrCache #(
     end
 endmodule
 
-module DdrBridge #(
-    parameter DDR_DATA_WIDTH = 128,
-    parameter DDR_ADDR_WIDTH = DDR_DATA_WIDTH == 256 ? 29 : 28
-) (
-    input clk,
-    input reset,
-
-    input start,
-    input clear,
-    input write,
-    input [27:0] address,
-    input [31:0] write_data,
-    input [3:0] write_mask,
-    output [31:0] read_data,
-    output reg [DDR_DATA_WIDTH-1:0] read_line,
-    output reg done,
-
-    input ddr_clk,
-    input ddr_calib,
-    input ddr_cmd_ready,
-    output [2:0] ddr_cmd,
-    output ddr_cmd_en,
-    output [DDR_ADDR_WIDTH-1:0] ddr_addr,
-    input ddr_wr_data_rdy,
-    output [DDR_DATA_WIDTH-1:0] ddr_wr_data,
-    output ddr_wr_data_en,
-    output ddr_wr_data_end,
-    output [DDR_DATA_WIDTH/8-1:0] ddr_wr_data_mask,
-    input [DDR_DATA_WIDTH-1:0] ddr_rd_data,
-    input ddr_rd_data_valid
-);
-    localparam OFFSET_BITS = $clog2(DDR_DATA_WIDTH/8);
-    localparam CMD_WRITE = 3'd0;
-    localparam CMD_READ = 3'd1;
-
-    // ----------------------- core domain -----------------------
-    reg req_toggle;
-    reg pending;
-    reg req_write;
-    reg [27:0] req_address;
-    reg [31:0] req_data;
-    reg [3:0] req_mask;
-
-    reg [DDR_DATA_WIDTH-1:0] ddr_result;
-    reg ack_toggle;
-
-    (* async_reg = "true" *) reg [2:0] ack_sync;
-
-    always @(posedge clk or posedge reset) begin
-        if (reset) begin
-            req_toggle <= 0;
-            pending <= 0;
-            done <= 0;
-            req_write <= 0;
-            req_address <= 0;
-            req_data <= 0;
-            req_mask <= 0;
-            read_line <= 0;
-            ack_sync <= 0;
-        end else begin
-            ack_sync <= {ack_sync[1:0], ack_toggle};
-
-            if (start && !pending && !done) begin
-                req_write <= write;
-                req_address <= address;
-                req_data <= write_data;
-                req_mask <= write_mask;
-                req_toggle <= !req_toggle;
-                pending <= 1;
-            end
-
-            if (pending && (ack_sync[2] != ack_sync[1])) begin
-                read_line <= ddr_result;
-                pending <= 0;
-                done <= 1;
-            end
-
-            if (clear) begin
-                done <= 0;
-            end
-        end
-    end
-
-    assign read_data = read_line[req_address[OFFSET_BITS-1:2]*32 +: 32];
-
-    // ----------------------- DDR domain -----------------------
-    wire [27:0] word = req_address >> $clog2(DDR_DATA_WIDTH/64);
-    assign ddr_addr = {1'b0, word[12:10], word[DDR_ADDR_WIDTH-2:13], word[9:3], 3'b000};
-    wire [OFFSET_BITS-3:0] lane = req_address[OFFSET_BITS-1:2];
-    assign ddr_wr_data = {(DDR_DATA_WIDTH/32){req_data}};
-    assign ddr_wr_data_mask = ~({{(DDR_DATA_WIDTH/8-4){1'b0}}, req_mask} << (lane * 4));
-
-    (* async_reg = "true" *) reg [2:0] req_sync;
-    (* async_reg = "true" *) reg [1:0] ddr_reset_sync;
-    wire ddr_reset = ddr_reset_sync[1];
-
-    reg write_pending;
-    reg command_pending;
-    reg reading;
-
-    assign ddr_cmd = req_write ? CMD_WRITE : CMD_READ;
-    assign ddr_cmd_en = command_pending && ddr_calib && ddr_cmd_ready;
-    assign ddr_wr_data_en = write_pending && ddr_calib && ddr_wr_data_rdy;
-    assign ddr_wr_data_end = ddr_wr_data_en;
-
-    always @(posedge ddr_clk or posedge reset) begin
-        if (reset) begin
-            ddr_reset_sync <= 2'b11;
-        end else begin
-            ddr_reset_sync <= {ddr_reset_sync[0], 1'b0};
-        end
-    end
-
-    always @(posedge ddr_clk) begin
-        if (ddr_reset) begin
-            req_sync <= 0;
-            ack_toggle <= 0;
-            write_pending <= 0;
-            command_pending <= 0;
-            reading <= 0;
-            ddr_result <= 0;
-        end else begin
-            req_sync <= {req_sync[1:0], req_toggle};
-
-            if (req_sync[2] != req_sync[1]) begin
-                write_pending <= req_write;
-                command_pending <= !req_write;
-            end
-
-            if (ddr_wr_data_en) begin
-                write_pending <= 0;
-                command_pending <= 1;
-            end
-
-            if (ddr_cmd_en) begin
-                command_pending <= 0;
-                if (req_write) begin
-                    ack_toggle <= !ack_toggle;
-                end else begin
-                    reading <= 1;
-                end
-            end
-
-            if (reading && ddr_rd_data_valid) begin
-                ddr_result <= ddr_rd_data;
-                reading <= 0;
-                ack_toggle <= !ack_toggle;
-            end
-        end
-    end
-endmodule
-
 module Gpio #(
     parameter BASE_ADDRESS = 32'h80000000
 ) (
@@ -3001,14 +3049,14 @@ module Gpio #(
     input [31:0] write_data,
     input [3:0] write_mask,
     input write_enable,
-    
+
     input [31:0] pins_in,
     output [31:0] pins_in_sync,
     output [31:0] irq_rise,
-    
+
     output reg [31:0] pins_out,
     output reg [31:0] pins_oe,
-    
+
     output reg [31:0] read_data
 );
     (* async_reg = "true" *) reg [31:0] pins_meta;
@@ -3190,10 +3238,48 @@ module MultiCoreArbiter #(
     end
 endmodule
 
+module PhoenixControl (
+    input clk,
+    input reset,
+    input write_enable,
+    input [31:0] write_data,
+    input [3:0] write_mask,
+    output [31:0] read_data,
+    output coprocessor_reset,
+    output prog_write,
+    output [15:0] prog_address,
+    output [7:0] prog_data
+);
+    reg [24:0] control;
+    wire [31:0] mask = {{8{write_mask[3]}}, {8{write_mask[2]}},
+                        {8{write_mask[1]}}, {8{write_mask[0]}}};
+    wire [31:0] merged = (read_data & ~mask) | (write_data & mask);
+
+    assign read_data = {7'd0, control};
+    assign coprocessor_reset = reset || control[0];
+
+    assign prog_write = !reset && write_enable && write_mask[3] && write_data[25] &&
+                        control[0] && merged[0];
+
+    assign prog_address = merged[16:1];
+    assign prog_data = merged[24:17];
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            control <= 25'd1;
+        end else if (write_enable) begin
+            control <= merged[24:0];
+        end
+    end
+endmodule
+
 module Platform #(
-    parameter MEM_WORDS = 8192,
+    parameter HMEM_WORDS = 33554432,
+    parameter LMEM_WORDS = 8192,
     parameter MEM_INIT_FILE = "",
     parameter ROM = 0,
+    parameter ENABLE_PHOENIX = 0,
+    parameter PHOENIX_CLK_FREQ = 27000000,
     parameter NUM_HARTS = 1
 ) (
     input clk,
@@ -3222,6 +3308,8 @@ module Platform #(
     output tx,
     input rx1,
     output tx1,
+    input [7:0] phoenix_gpio_in,
+    output [7:0] phoenix_gpio_out,
     output spi0_sclk,
     output spi0_mosi,
     input spi0_miso,
@@ -3239,17 +3327,20 @@ module Platform #(
 
     wire [31:0] a = address[31:0];
 
-    wire ram_sel = a < MEM_WORDS * 4;
-    wire ddr_sel = a >= 32'h40000000 && a < 32'h48000000;
+    wire ram_sel = a < LMEM_WORDS * 4;
+    wire ddr_sel = a >= 32'h40000000 && a < (34'h040000000 + HMEM_WORDS * 34'd4);
     wire gpio_sel = a >= 32'h80000000 && a < 32'h80000008;
     wire uart0_sel = a >= 32'h80000008 && a < 32'h80000014;
     wire uart1_sel = a >= 32'h80000020 && a < 32'h8000002c;
+    wire uart2_sel = ENABLE_PHOENIX && a >= 32'h80000080 && a < 32'h8000008c;
+    wire phoenix_sel = a == 32'h80000090;
     wire spi0_sel = a >= 32'h80000040 && a < 32'h80000050;
     wire spi1_sel = a >= 32'h80000060 && a < 32'h80000070;
     wire clint_sel = a >= 32'h02000000 && a < 32'h02010000;
     wire plic_sel = a >= 32'h0c000000 && a < 32'h10000000;
 
-    wire mmio_sel = gpio_sel || uart0_sel || uart1_sel || spi0_sel || spi1_sel || clint_sel || plic_sel;
+    wire meminfo_sel = a == 32'h80000018;
+    wire mmio_sel = uart2_sel || phoenix_sel || meminfo_sel || gpio_sel || uart0_sel || uart1_sel || spi0_sel || spi1_sel || clint_sel || plic_sel;
 
     wire bad = address[33:32] != 0 || a[1:0] != 0 || kind == 3 ||
                (!ram_sel && !ddr_sel && !mmio_sel) ||
@@ -3264,6 +3355,9 @@ module Platform #(
     wire [31:0] gpio_data;
     wire [31:0] uart0_data;
     wire [31:0] uart1_data;
+    wire [31:0] uart2_data;
+    wire [31:0] phoenix_data;
+    wire uart2_irq;
     wire [31:0] spi0_data;
     wire [31:0] spi1_data;
     wire [31:0] clint_data;
@@ -3272,6 +3366,7 @@ module Platform #(
     wire uart0_irq;
     wire uart1_irq;
     wire [31:0] gpio_irq;
+    wire [34:0] platform_irq_sources = {uart2_irq, gpio_irq, uart1_irq, uart0_irq};
 
     wire commit = valid && ready && !error;
     wire wr_commit = commit && write;
@@ -3296,11 +3391,14 @@ module Platform #(
     end
 
     always @(*) begin
-        rdata = ({32{memory_data_valid && !(ROM && write) && ram_sel}} & ram_data) |
+        rdata = ({32{mmio_data_valid && meminfo_sel}} & (HMEM_WORDS * 32'd4)) |
+            ({32{memory_data_valid && !(ROM && write) && ram_sel}} & ram_data) |
             ({32{memory_data_valid && ddr_sel}} & ddr_rdata) |
             ({32{mmio_data_valid && gpio_sel}} & gpio_data) |
             ({32{mmio_data_valid && uart0_sel}} & uart0_data) |
             ({32{mmio_data_valid && uart1_sel}} & uart1_data) |
+            ({32{mmio_data_valid && uart2_sel}} & uart2_data) |
+            ({32{mmio_data_valid && phoenix_sel}} & phoenix_data) |
             ({32{mmio_data_valid && spi0_sel}} & spi0_data) |
             ({32{mmio_data_valid && spi1_sel}} & spi1_data) |
             ({32{mmio_data_valid && clint_sel}} & clint_data) |
@@ -3308,7 +3406,7 @@ module Platform #(
     end
 
     Sram #(
-        .MEM_WORDS(MEM_WORDS),
+        .LMEM_WORDS(LMEM_WORDS),
         .MEM_INIT_FILE(MEM_INIT_FILE)
     ) ram (
         .clk(clk),
@@ -3365,6 +3463,63 @@ module Platform #(
         .read_data(uart1_data)
     );
 
+    generate if (ENABLE_PHOENIX) begin : phoenix_coprocessor
+        wire host_tx;
+        wire phoenix_tx;
+        wire coprocessor_reset;
+        wire prog_write;
+        wire [15:0] prog_address;
+        wire [7:0] prog_data;
+
+        PhoenixControl control (
+            .clk(clk),
+            .reset(reset),
+            .write_enable(wr_commit && phoenix_sel),
+            .write_data(wdata),
+            .write_mask(wstrb),
+            .read_data(phoenix_data),
+            .coprocessor_reset(coprocessor_reset),
+            .prog_write(prog_write),
+            .prog_address(prog_address),
+            .prog_data(prog_data)
+        );
+
+        Uart #(
+            .BASE_ADDRESS(32'h80000080)
+        ) uart2 (
+            .clk(clk),
+            .reset(reset),
+            .address(a),
+            .write_data(wdata),
+            .write_mask(wstrb),
+            .write_enable(wr_commit && uart2_sel),
+            .read_commit(rd_commit && uart2_sel),
+            .rx(phoenix_tx),
+            .tx(host_tx),
+            .rx_valid(uart2_irq),
+            .read_data(uart2_data)
+        );
+
+        PhoenixCoprocessor #(
+            .CLK_FREQ(PHOENIX_CLK_FREQ)
+        ) coprocessor (
+            .clk(clk),
+            .reset(coprocessor_reset),
+            .prog_write(prog_write),
+            .prog_address(prog_address),
+            .prog_data(prog_data),
+            .rx(host_tx),
+            .tx(phoenix_tx),
+            .gpio_in(phoenix_gpio_in),
+            .gpio_out(phoenix_gpio_out)
+        );
+    end else begin : no_phoenix
+        assign phoenix_data = 32'hffffffff;
+        assign uart2_data = 0;
+        assign uart2_irq = 0;
+        assign phoenix_gpio_out = 0;
+    end endgenerate
+
     Spi spi0 (
         .clk(clk),
         .reset(reset),
@@ -3409,13 +3564,14 @@ module Platform #(
         .irq_timer(irq_timer),
         .time_value(time_value)
     );
-    
+
     Plic #(
+        .NUM_SOURCES(ENABLE_PHOENIX ? 35 : 34),
         .NUM_HARTS(NUM_HARTS)
     ) plic (
         .clk(clk),
         .reset(reset),
-        .irq_sources({gpio_irq, uart1_irq, uart0_irq}),
+        .irq_sources(platform_irq_sources[(ENABLE_PHOENIX ? 35 : 34)-1:0]),
         .address(a),
         .write_data(wdata),
         .write_mask(wstrb),
@@ -3424,6 +3580,99 @@ module Platform #(
         .read_data(plic_data),
         .irq_machine(irq_machine),
         .irq_supervisor(irq_supervisor)
+    );
+endmodule
+
+module BasicPlatform #(
+    parameter MEM_INIT_FILE = "",
+    parameter ENABLE_PHOENIX = 0,
+    parameter PHOENIX_CLK_FREQ = 27000000,
+    parameter NUM_HARTS = 1
+) (
+    input clk,
+    input reset,
+    input valid,
+    input [33:0] address,
+    input write,
+    input [31:0] wdata,
+    input [3:0] wstrb,
+    input [1:0] kind,
+    output ready,
+    output [31:0] rdata,
+    output error,
+    input [31:0] gpio_in,
+    output [31:0] gpio_out,
+    output [31:0] gpio_oe,
+    input rx,
+    output tx,
+    input rx1,
+    output tx1,
+    input [7:0] phoenix_gpio_in,
+    output [7:0] phoenix_gpio_out,
+    output spi0_sclk,
+    output spi0_mosi,
+    input spi0_miso,
+    output spi0_cs_n,
+    output spi1_sclk,
+    output spi1_mosi,
+    input spi1_miso,
+    output spi1_cs_n,
+    output [NUM_HARTS-1:0] irq_machine,
+    output [NUM_HARTS-1:0] irq_supervisor,
+    output [NUM_HARTS-1:0] irq_software,
+    output [NUM_HARTS-1:0] irq_timer,
+    output [63:0] time_value
+);
+    Platform #(
+        .HMEM_WORDS(0),
+        .LMEM_WORDS(16384),
+        .MEM_INIT_FILE(MEM_INIT_FILE),
+        .ROM(0),
+        .ENABLE_PHOENIX(ENABLE_PHOENIX),
+        .PHOENIX_CLK_FREQ(PHOENIX_CLK_FREQ),
+        .NUM_HARTS(NUM_HARTS)
+    ) platform (
+        .clk(clk),
+        .reset(reset),
+        .valid(valid),
+        .address(address),
+        .write(write),
+        .wdata(wdata),
+        .wstrb(wstrb),
+        .kind(kind),
+        .ready(ready),
+        .rdata(rdata),
+        .error(error),
+        .gpio_in(gpio_in),
+        .gpio_out(gpio_out),
+        .gpio_oe(gpio_oe),
+        .rx(rx),
+        .tx(tx),
+        .rx1(rx1),
+        .tx1(tx1),
+        .phoenix_gpio_in(phoenix_gpio_in),
+        .phoenix_gpio_out(phoenix_gpio_out),
+        .spi0_sclk(spi0_sclk),
+        .spi0_mosi(spi0_mosi),
+        .spi0_miso(spi0_miso),
+        .spi0_cs_n(spi0_cs_n),
+        .spi1_sclk(spi1_sclk),
+        .spi1_mosi(spi1_mosi),
+        .spi1_miso(spi1_miso),
+        .spi1_cs_n(spi1_cs_n),
+        .irq_machine(irq_machine),
+        .irq_supervisor(irq_supervisor),
+        .irq_software(irq_software),
+        .irq_timer(irq_timer),
+        .time_value(time_value),
+        .ddr_valid(),
+        .ddr_address(),
+        .ddr_write(),
+        .ddr_wdata(),
+        .ddr_wstrb(),
+        .ddr_ready(1'b0),
+        .ddr_rdata(32'd0),
+        .ddr_error(1'b0)
     );
 endmodule
 
@@ -3467,7 +3716,7 @@ module TinyPlatform (
 
     wire mmio_sel = uart_sel || spi_sel || clint_sel || plic_sel;
     wire mem_sel = flash_sel || ram_sel;
-    
+
     wire bad = address[33:32] != 0 || a[1:0] != 0 || kind == 3 ||
                !(mem_sel || mmio_sel) || (write && flash_sel) ||
                (kind != 0 && (mmio_sel || write));
@@ -3480,9 +3729,9 @@ module TinyPlatform (
     wire [31:0] spi_data;
     wire [31:0] clint_data;
     wire [31:0] plic_data;
-    
+
     wire uart_irq;
-    
+
     wire commit = valid && ready && !error;
     wire wr_commit = commit && write;
     wire rd_commit = commit && !write;
@@ -3495,7 +3744,7 @@ module TinyPlatform (
         if (!bad) begin
             if (mem_sel) begin
                 rdata = mem_data;
-            end else if (uart_sel) begin 
+            end else if (uart_sel) begin
                 rdata = uart_data;
             end else if (spi_sel) begin
                 rdata = spi_data;
@@ -3873,7 +4122,7 @@ module SerialMemory #(
                 end
 
                 SETUP: state <= SAMPLE;
-                
+
                 SAMPLE: begin
                     if (!req_write && bit_count >= 32) begin
                         rx_shift <= {rx_shift[30:0], miso};
@@ -3881,7 +4130,7 @@ module SerialMemory #(
 
                     tx_shift <= {tx_shift[38:0], 1'b0};
                     bit_count <= bit_count + 1'b1;
-                    
+
                     if (init_step != INIT_DONE && bit_count == 39) begin
                         init_step <= init_step + 1'b1;
                         state <= IDLE;
@@ -3903,7 +4152,7 @@ module SerialMemory #(
                 DONE: if (!valid) begin
                     state <= IDLE;
                 end
-                
+
                 default: state <= IDLE;
             endcase
         end
@@ -4028,37 +4277,37 @@ module Spi #(
 endmodule
 
 module Sram #(
-    parameter MEM_WORDS = 8192,
+    parameter LMEM_WORDS = 8192,
     parameter MEM_INIT_FILE = "firmware.hex"
 ) (
     input clk,
 
     input read_enable,
     input [31:0] address,
-    
+
     output reg [31:0] read_data,
-    
+
     input write_enable,
     input [31:0] write_data,
     input [3:0] write_mask
 );
-    localparam ADDR_BITS = $clog2(MEM_WORDS);
+    localparam ADDR_BITS = $clog2(LMEM_WORDS);
 
-    (* ram_style = "block", syn_ramstyle = "block_ram" *) reg [31:0] mem [0:MEM_WORDS-1];
-    wire in_range = address < MEM_WORDS * 4;
+    (* ram_style = "block", syn_ramstyle = "block_ram" *) reg [31:0] mem [0:LMEM_WORDS-1];
+    wire in_range = address < LMEM_WORDS * 4;
     wire [ADDR_BITS-1:0] word_address = address[ADDR_BITS+1:2];
-    
+
     initial begin
         if (MEM_INIT_FILE != "") begin
             $readmemh(MEM_INIT_FILE, mem);
         end
     end
-    
+
     always @(posedge clk) begin
         if (read_enable) begin
             read_data <= in_range ? mem[word_address] : 32'd0;
         end
-        
+
         if (write_enable && in_range) begin
             if (write_mask[0]) begin
                 mem[word_address][7:0] <= write_data[7:0];
@@ -4079,7 +4328,8 @@ module Sram #(
     end
 endmodule
 module Uart #(
-    parameter BASE_ADDRESS = 32'h80000008
+    parameter BASE_ADDRESS = 32'h80000008,
+    parameter RX_FIFO_DEPTH = 16
 ) (
     input clk,
     input reset,
@@ -4146,7 +4396,9 @@ module Uart #(
         .busy(tx_busy)
     );
 
-    UartRx rx_unit (
+    UartRx #(
+        .FIFO_DEPTH(RX_FIFO_DEPTH)
+    ) rx_unit (
         .clk(clk),
         .reset(reset),
         .scaler(scaler),
@@ -4206,7 +4458,7 @@ module UartTx (
                     tx <= payload[0];
                     state <= DATA;
                 end
-                
+
                 DATA: if (bitpos == 7) begin
                     tx <= 1'b1;
                     state <= STOP;
@@ -4226,26 +4478,81 @@ module UartTx (
     end
 endmodule
 
-module UartRx (
+module UartRx #(
+    parameter FIFO_DEPTH = 16
+) (
     input clk,
     input reset,
     input [31:0] scaler,
     input rx,
     input clear,
-    output reg [7:0] data,
-    output reg valid
+    output [7:0] data,
+    output valid
 );
     localparam IDLE = 2'd0;
     localparam START = 2'd1;
     localparam DATA = 2'd2;
     localparam STOP = 2'd3;
 
+    localparam FIFO_PTR_WIDTH = (FIFO_DEPTH > 1) ? $clog2(FIFO_DEPTH) : 1;
+    localparam FIFO_COUNT_WIDTH = $clog2(FIFO_DEPTH + 1);
+    localparam FIFO_LAST = FIFO_DEPTH - 1;
+
     reg [1:0] state;
     reg [31:0] count;
     reg [2:0] bitpos;
     reg [7:0] shift;
+
+    reg [7:0] fifo [0:FIFO_DEPTH-1];
+    reg [FIFO_PTR_WIDTH-1:0] read_ptr;
+    reg [FIFO_PTR_WIDTH-1:0] write_ptr;
+    reg [FIFO_COUNT_WIDTH-1:0] fifo_count;
+
     (* async_reg = "true" *) reg rx_meta;
     (* async_reg = "true" *) reg rx_sync;
+
+    wire pop;
+    wire frame_valid;
+    wire push;
+
+    assign pop = clear && valid;
+    assign frame_valid = state == STOP && count == 0 && rx_sync;
+
+    assign push = frame_valid && (fifo_count < FIFO_DEPTH || pop);
+
+    assign valid = fifo_count != 0;
+    assign data = valid ? fifo[read_ptr] : 8'd0;
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            read_ptr <= 0;
+            write_ptr <= 0;
+            fifo_count <= 0;
+        end else begin
+            if (push) begin
+                fifo[write_ptr] <= shift;
+                if (write_ptr == FIFO_LAST[FIFO_PTR_WIDTH-1:0]) begin
+                    write_ptr <= 0;
+                end else begin
+                    write_ptr <= write_ptr + 1'b1;
+                end
+            end
+
+            if (pop) begin
+                if (read_ptr == FIFO_LAST[FIFO_PTR_WIDTH-1:0]) begin
+                    read_ptr <= 0;
+                end else begin
+                    read_ptr <= read_ptr + 1'b1;
+                end
+            end
+
+            case ({push, pop})
+                2'b10: fifo_count <= fifo_count + 1'b1;
+                2'b01: fifo_count <= fifo_count - 1'b1;
+                default: ;
+            endcase
+        end
+    end
 
     always @(posedge clk or posedge reset) begin
         if (reset) begin
@@ -4253,20 +4560,14 @@ module UartRx (
             count <= 0;
             bitpos <= 0;
             shift <= 0;
-            data <= 0;
-            valid <= 0;
             rx_meta <= 1;
             rx_sync <= 1;
         end else begin
             rx_meta <= rx;
             rx_sync <= rx_meta;
 
-            if (clear) begin
-                valid <= 1'b0;
-            end
-
             case (state)
-                IDLE: if (!rx_sync && !valid) begin
+                IDLE: if (!rx_sync) begin
                     count <= (scaler + 1'b1) >> 1;
                     bitpos <= 0;
                     state <= START;
@@ -4280,7 +4581,7 @@ module UartRx (
                 end else begin
                     state <= IDLE;
                 end
-                
+
                 DATA: if (count != 0) begin
                     count <= count - 1'b1;
                 end else begin
@@ -4289,20 +4590,15 @@ module UartRx (
                     if (bitpos == 7) state <= STOP;
                     else bitpos <= bitpos + 1'b1;
                 end
-                
+
                 STOP: if (count != 0) begin
                     count <= count - 1'b1;
                 end else begin
-                    if (rx_sync) begin
-                        data <= shift;
-                        valid <= 1'b1;
-                    end
                     state <= IDLE;
                 end
-                
+
                 default: state <= IDLE;
             endcase
         end
     end
 endmodule
-
