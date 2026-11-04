@@ -42,8 +42,7 @@ module tt_um_toxicfox_inferno (
 
     RiscV #(
         .RESET_PC(32'h00000000),
-        .ENABLE_MMU(1),
-        .TLB_ENTRIES(8)
+        .ENABLE_MMU(0)
     ) cpu (
         .clk(clk),
         .reset(reset),
